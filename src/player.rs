@@ -162,12 +162,12 @@ impl Player {
 
     /// Switches to the battle music as a battle starts and back to the
     /// exploring song, where it left off, once it ends.
-    fn follow_battle(&mut self, game: &mut Game, scene: crate::config::Scene, mode: crate::config::Mode) {
+    fn follow_battle(&mut self, game: &mut Game, scene: crate::config::Scene, play_in: crate::config::PlayIn) {
         let (has_battle_list, playing) = {
             let s = state::lock();
             (s.config.battle_playlist.is_some(), s.playing)
         };
-        let battle = scene == crate::config::Scene::Battle && mode.covers(scene) && has_battle_list;
+        let battle = scene == crate::config::Scene::Battle && play_in.covers(scene) && has_battle_list;
         if battle == self.in_battle {
             return;
         }
@@ -306,12 +306,12 @@ impl Player {
         refresh_game_tracks(game);
         let scene = game.scene();
 
-        let (commands, mode, volume, level_db, cf) = {
+        let (commands, play_in, volume, level_db, cf) = {
             let mut s = state::lock();
             s.scene = scene;
             (
                 s.commands.drain(..).collect::<Vec<_>>(),
-                s.config.mode,
+                s.config.play_in(),
                 s.config.volume,
                 s.config.my_music_level_db,
                 s.config.crossfade_secs.max(0.0),
@@ -333,7 +333,7 @@ impl Player {
             }
         }
         self.resume_last(game);
-        self.follow_battle(game, scene, mode);
+        self.follow_battle(game, scene, play_in);
         self.run_check(game);
         self.fade_files();
 
@@ -425,7 +425,7 @@ impl Player {
         }
 
         let playing = state::lock().playing;
-        let covered = mode.covers(scene);
+        let covered = play_in.covers(scene);
         // A pending retry keeps the game's music muted, so the gap is quiet.
         let active = playing && covered && (self.now.is_some() || self.retry.is_some());
         self.set_paused(game, !active);

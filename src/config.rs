@@ -6,39 +6,53 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Where the jukebox is allowed to replace the game's own music.
+/// Where the jukebox replaces the game's own music. Each place is switched
+/// on or off on its own from the menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayIn {
+    /// Field, towns and dungeons.
+    pub exploring: bool,
+    pub battles: bool,
+    /// Story events played in the engine.
+    pub cutscenes: bool,
+}
+
+impl Default for PlayIn {
+    fn default() -> Self {
+        PlayIn { exploring: true, battles: false, cutscenes: false }
+    }
+}
+
+impl PlayIn {
+    /// Whether the jukebox plays in `scene`.
+    pub fn covers(self, scene: Scene) -> bool {
+        match scene {
+            Scene::Exploring => self.exploring,
+            Scene::Battle => self.battles,
+            Scene::Event => self.cutscenes,
+            // A movie's own soundtrack can't be muted, so nothing plays over it.
+            Scene::Movie => false,
+        }
+    }
+}
+
+/// The single choice that came before `PlayIn`, still read from older
+/// config files so their setting carries over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub enum Mode {
-    /// Field, towns and dungeons only. Battles and story events keep their music.
     #[default]
     JustExploring,
-    /// Everywhere except story events.
     ExploringAndBattles,
-    /// Everywhere, story events included.
     All,
 }
 
-impl Mode {
-    pub const ALL: [Mode; 3] = [Mode::JustExploring, Mode::ExploringAndBattles, Mode::All];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::JustExploring => "Just Exploring",
-            Mode::ExploringAndBattles => "Exploring and Battles",
-            Mode::All => "Exploring, Battling, and Cutscenes",
-        }
-    }
-
-    /// Whether the jukebox plays in `scene`.
-    pub fn covers(self, scene: Scene) -> bool {
-        match (self, scene) {
-            // A movie's own soundtrack can't be muted, so no mode plays over it.
-            (_, Scene::Movie) => false,
-            (Mode::All, _) => true,
-            (_, Scene::Event) => false,
-            (Mode::ExploringAndBattles, Scene::Battle) => true,
-            (Mode::JustExploring, Scene::Battle) => false,
-            (_, Scene::Exploring) => true,
+impl From<Mode> for PlayIn {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::JustExploring => PlayIn::default(),
+            Mode::ExploringAndBattles => PlayIn { exploring: true, battles: true, cutscenes: false },
+            Mode::All => PlayIn { exploring: true, battles: true, cutscenes: true },
         }
     }
 }
@@ -138,7 +152,11 @@ pub struct Config {
     /// Held to show the mouse cursor over the game, for reaching the mini
     /// player while exploring. Left Alt.
     pub key_show_cursor: i32,
+    /// Only read from older files; `play_in` replaces it.
+    #[serde(skip_serializing)]
     pub mode: Mode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub play_in: Option<PlayIn>,
     pub repeat: Repeat,
     pub shuffle: bool,
     /// 0.0 - 1.5 (0 - 150%), applied to both game songs and your own files.
@@ -149,7 +167,7 @@ pub struct Config {
     /// .asi's folder.
     pub music_folder: String,
     pub playlist: Playlist,
-    /// Where battle music comes from, in modes that play during battles.
+    /// Where battle music comes from, when the jukebox plays in battles.
     /// `None` keeps playing from `playlist`. With one set, a battle starts a
     /// song from it, and the exploring song picks up where it left off after.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,6 +239,7 @@ impl Default for Config {
             key_volume_up: 0xBB,
             key_show_cursor: 0xA4,
             mode: Mode::default(),
+            play_in: None,
             repeat: Repeat::default(),
             shuffle: false,
             volume: 0.8,
@@ -292,6 +311,12 @@ impl Bind {
 }
 
 impl Config {
+    /// Where the jukebox plays, carried over from the older single choice
+    /// until the toggles are first changed.
+    pub fn play_in(&self) -> PlayIn {
+        self.play_in.unwrap_or_else(|| self.mode.into())
+    }
+
     pub fn key(&self, bind: Bind) -> i32 {
         match bind {
             Bind::Menu => self.menu_key,
@@ -422,6 +447,26 @@ mod tests {
         c.volume = 0.02;
         c.step_volume(-0.05);
         assert_eq!(c.volume, 0.0);
+    }
+
+    #[test]
+    fn play_in_carries_over_the_old_mode_and_saves_as_toggles() {
+        // An older file with only the single choice keeps its setting.
+        let old: Config = toml::from_str("mode = \"ExploringAndBattles\"").unwrap();
+        assert_eq!(old.play_in(), PlayIn { exploring: true, battles: true, cutscenes: false });
+        assert_eq!(Config::default().play_in(), PlayIn::default());
+
+        // Battles alone: only battles are covered, and movies never are.
+        let mut c = Config::default();
+        c.play_in = Some(PlayIn { exploring: false, battles: true, cutscenes: false });
+        let p = c.play_in();
+        assert!(p.covers(Scene::Battle));
+        assert!(!p.covers(Scene::Exploring) && !p.covers(Scene::Event) && !p.covers(Scene::Movie));
+
+        // Saved as toggles; the old field isn't written back.
+        let text = toml::to_string(&c).unwrap();
+        assert!(!text.contains("mode ="));
+        assert_eq!(toml::from_str::<Config>(&text).unwrap().play_in(), p);
     }
 
     #[test]

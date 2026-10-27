@@ -8,7 +8,7 @@ use hudhook::imgui::{
 };
 use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
 
-use crate::config::{Bind, Mode, Playlist, Repeat};
+use crate::config::{Bind, Playlist, Repeat};
 use crate::keys::{self, KeyPoll};
 use crate::state::{self, Command, List};
 use crate::theme::{self, ACCENT, DIM, Icon};
@@ -938,20 +938,28 @@ impl ImguiRenderLoop for Menu {
                     ui.set_next_item_width(-1.0);
                 };
 
-                let mut mode = Mode::ALL.iter().position(|m| *m == s.config.mode).unwrap_or(0);
-                let labels: Vec<_> = Mode::ALL.iter().map(|m| m.label()).collect();
+                // One toggle per place, so any mix can be on.
                 field("Play during");
-                if theme::combo(ui, "##mode", &mut mode, &labels) {
-                    s.config.mode = Mode::ALL[mode];
-                    config_changed = true;
+                let mut play = s.config.play_in();
+                let w = (ui.content_region_avail()[0] - gap[0] * 2.0) / 3.0;
+                let places = [
+                    ("Exploring", "Field, towns and dungeons.", &mut play.exploring),
+                    ("Battles", "Replaces the battle music.", &mut play.battles),
+                    ("Cutscenes", "Replaces the music of story events.\nPre-rendered movies keep their own.", &mut play.cutscenes),
+                ];
+                let mut toggled = false;
+                for (n, (label, tip, on)) in places.into_iter().enumerate() {
+                    if n > 0 {
+                        ui.same_line();
+                    }
+                    toggled |= theme::toggle(ui, label, on, [w, ui.frame_height()]);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(tip);
+                    }
                 }
-                if ui.is_item_hovered() {
-                    ui.tooltip_text(
-                        "Just Exploring: field, towns, dungeons.\n\
-                         Exploring and Battles: also replaces battle music.\n\
-                         Exploring, Battling, and Cutscenes: also replaces\n\
-                         story-event music.",
-                    );
+                if toggled {
+                    s.config.play_in = Some(play);
+                    config_changed = true;
                 }
                 let mut repeat = Repeat::ALL.iter().position(|r| *r == s.config.repeat).unwrap_or(0);
                 let labels: Vec<_> = Repeat::ALL.iter().map(|r| r.label()).collect();
@@ -989,7 +997,7 @@ impl ImguiRenderLoop for Menu {
                     ui.tooltip_text(
                         "A list of its own for battles. A battle starts a song from it,\n\
                          and your exploring song picks up where it left off afterwards.\n\
-                         Only in modes that play during battles.",
+                         Only while Battles is on.",
                     );
                 }
                 let mut vol = s.config.volume * 100.0;

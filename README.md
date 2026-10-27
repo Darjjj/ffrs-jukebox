@@ -12,8 +12,8 @@ music. An in-game menu in the game's own style, a mini player, hotkeys and contr
 - **Your own music.** Drop mp3, ogg, flac, wav, m4a or aac files into the `jukebox` folder. They are levelled
   automatically to match the game's music and follow the game's own Music and Master volume. Each folder
   inside becomes a playlist.
-- **Choose where it plays:** Just Exploring; Exploring and Battles; or Exploring, Battling, and Cutscenes.
-  Anywhere it doesn't play, the game's own music comes back.
+- **Choose where it plays:** switch Exploring, Battles and Cutscenes on or off, in any mix (Battles alone
+  works too). Anywhere it doesn't play, the game's own music comes back.
 - **Battle music of your choice.** Pick a separate list for fights; after the battle your exploring song
   picks up where it left off.
 - **Favorites, playlists, hide and rename** any song, from a right-click menu.

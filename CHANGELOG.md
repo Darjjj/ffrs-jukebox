@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0 - 2026-10-27
+
+- "Play during" is now three toggles, Exploring, Battles and Cutscenes, so any mix works, including
+  battles only. Your old choice carries over.
+
 ## 1.0.0 - 2026-10-27
 
 First release.
