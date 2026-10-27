@@ -176,6 +176,8 @@ pub struct Config {
     pub crossfade_secs: f32,
     /// Start the last song again, where it was, when the game starts.
     pub resume_on_start: bool,
+    /// Step aside for the game's victory fanfare after a won battle.
+    pub victory_fanfare: bool,
     /// Hold Left Trigger and press the D-pad: left previous, right next, up
     /// play/pause, down stop.
     pub controller: bool,
@@ -249,6 +251,7 @@ impl Default for Config {
             battle_playlist: None,
             crossfade_secs: 2.0,
             resume_on_start: true,
+            victory_fanfare: true,
             controller: true,
             loop_minutes: 3.0,
             titles: BTreeMap::new(),

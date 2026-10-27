@@ -57,6 +57,10 @@ const THEME_FADE: f32 = 4.0;
 /// The most the volume rises per tick (50 ms): 0 to 150% in 0.75 s.
 const VOLUME_RISE: f32 = 0.1;
 
+/// How long the jukebox fades out under the victory fanfare, and back in
+/// once the game moves on from it.
+const FANFARE_FADE: f32 = 1.5;
+
 enum Playing {
     Cue {
         id: i32,
@@ -114,6 +118,12 @@ pub struct Player {
     resumed: bool,
     /// When the current song and position were last saved for resuming.
     saved_at: Instant,
+    /// 1.0 normally, falling to 0.0 under the victory fanfare, and when it
+    /// was last stepped.
+    duck: f32,
+    duck_at: Instant,
+    /// This battle's fanfare has played; cleared once the battle is over.
+    after_fanfare: bool,
 }
 
 /// How often the current song and position are saved for resuming.
@@ -139,6 +149,9 @@ impl Player {
             fading_files: Vec::new(),
             resumed: false,
             saved_at: Instant::now(),
+            duck: 1.0,
+            duck_at: Instant::now(),
+            after_fanfare: false,
         }
     }
 
@@ -306,12 +319,13 @@ impl Player {
         refresh_game_tracks(game);
         let scene = game.scene();
 
-        let (commands, play_in, volume, level_db, cf) = {
+        let (commands, play_in, fanfare_setting, volume, level_db, cf) = {
             let mut s = state::lock();
             s.scene = scene;
             (
                 s.commands.drain(..).collect::<Vec<_>>(),
                 s.config.play_in(),
+                s.config.victory_fanfare,
                 s.config.volume,
                 s.config.my_music_level_db,
                 s.config.crossfade_secs.max(0.0),
@@ -425,10 +439,25 @@ impl Player {
         }
 
         let playing = state::lock().playing;
-        let covered = play_in.covers(scene);
+        // The game's victory fanfare plays out over a won battle's results;
+        // the jukebox picks up again once the game moves on from it.
+        let mut fanfare = fanfare_setting && game.current_bgm_cue().as_deref() == Some(crate::game::VICTORY_CUE);
+        // The battle ends a moment after the fanfare does; the battle song
+        // stays down until then instead of coming back for that moment.
+        let in_battle_scene = scene == crate::config::Scene::Battle;
+        self.after_fanfare = in_battle_scene && (self.after_fanfare || fanfare);
+        fanfare |= self.after_fanfare;
+        crate::log_change("fanfare", format!("player: victory fanfare playing={fanfare}"));
+        let covered = play_in.covers(scene) && !fanfare;
+        // The song fades out under the fanfare rather than stopping dead,
+        // and fades back in after it.
+        let step = self.duck_at.elapsed().as_secs_f32() / FANFARE_FADE;
+        self.duck_at = Instant::now();
+        self.duck = if fanfare { (self.duck - step).max(0.0) } else { (self.duck + step).min(1.0) };
+        let fading_out = fanfare && self.duck > 0.0 && play_in.covers(scene) && self.now.is_some();
         // A pending retry keeps the game's music muted, so the gap is quiet.
         let active = playing && covered && (self.now.is_some() || self.retry.is_some());
-        self.set_paused(game, !active);
+        self.set_paused(game, !(active || (playing && fading_out)));
         if active {
             let own = match &self.now {
                 Some((_, Playing::Cue { id, .. })) => Some(*id),
@@ -442,7 +471,7 @@ impl Player {
         // of the slider would otherwise jump straight to 150%.
         self.ramped = if volume > self.ramped { (self.ramped + VOLUME_RISE).min(volume) } else { volume };
         // A song crossfading in rises from silence.
-        let volume = self.ramped * self.fade_in_level();
+        let volume = self.ramped * self.fade_in_level() * self.duck;
         match &mut self.now {
             Some((_, Playing::Cue { id, .. })) if (volume - self.volume).abs() > 1e-4 => {
                 self.volume = volume;

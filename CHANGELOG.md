@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 - 2026-10-27
+
+- New setting, "Let the victory fanfare play" (on by default): winning a battle fades the jukebox out
+  for the game's own victory fanfare, then goes straight back to your exploring song once the
+  battle is over.
+
 ## 1.1.0 - 2026-10-27
 
 - "Play during" is now three toggles, Exploring, Battles and Cutscenes, so any mix works, including

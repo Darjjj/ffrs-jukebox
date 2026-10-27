@@ -16,6 +16,8 @@ music. An in-game menu in the game's own style, a mini player, hotkeys and contr
   works too). Anywhere it doesn't play, the game's own music comes back.
 - **Battle music of your choice.** Pick a separate list for fights; after the battle your exploring song
   picks up where it left off.
+- **Victory fanfare.** Winning a battle fades the jukebox out for the game's own fanfare, then picks up
+  your exploring song again (a setting, on by default).
 - **Favorites, playlists, hide and rename** any song, from a right-click menu.
 - **Shuffle without repeats**, repeat song or playlist, **crossfade** between songs, and **resume** the last
   song where you left it when the game starts.

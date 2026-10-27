@@ -381,7 +381,31 @@ impl Game {
         let id = self.sm()?.GetCurrentPlayBGMId();
         (id >= 0).then_some(id)
     }
+
+    /// The cue name of the game's current BGM. Looked up once per play id:
+    /// the name comes back as a string the engine allocates.
+    pub fn current_bgm_cue(&mut self) -> Option<String> {
+        let id = self.current_bgm()?;
+        let mut cached = BGM_CUE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((known, name)) = cached.as_ref() {
+            if *known == id {
+                return Some(name.clone());
+            }
+        }
+        let sound = *self.sm()?.m_PlaySoundList.get(&id)?;
+        let atom = unsafe { sound.as_mut()?.m_AtomComponent.as_mut()? };
+        let name = atom.GetCueName().ToString();
+        log::info!("game: game BGM id {id} is {name}");
+        *cached = Some((id, name.clone()));
+        Some(name)
+    }
 }
+
+/// The game's victory fanfare, played on the results after a won battle.
+pub const VICTORY_CUE: &str = "BGM_PP_BATTLEEND";
+
+/// The last BGM play id looked up by [`Game::current_bgm_cue`], and its cue.
+static BGM_CUE: std::sync::Mutex<Option<(i32, String)>> = std::sync::Mutex::new(None);
 
 /// A game volume as 0.0 - 1.0, in case the game keeps it as a 0-10 or
 /// 0-100 setting.

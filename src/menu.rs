@@ -460,6 +460,12 @@ impl Menu {
                 if ui.is_item_hovered() {
                     ui.tooltip_text("When the game starts, carry on with the song you were\nplaying last time, where you left it. Stop clears it.");
                 }
+                if ui.checkbox("Let the victory fanfare play", &mut s.config.victory_fanfare) {
+                    changed = true;
+                }
+                if ui.is_item_hovered() {
+                    ui.tooltip_text("Winning a battle pauses the jukebox for the game's own\nvictory fanfare, then picks up again once it's over.");
+                }
             });
         if changed {
             s.save_config();
