@@ -11,7 +11,7 @@ First release.
 - Modes: Just Exploring, Exploring and Battles, or Exploring, Battling, and Cutscenes.
 - Separate battle music, with the exploring song picking up where it left off afterwards.
 - Favorites, your own playlists, hide songs, rename songs. Playlists show as cards with Play and
-  Shuffle; inside one, drag a song's number to reorder.
+  Shuffle; inside one, drag a song by its title to reorder (Favorites too).
 - Shuffle without repeats, repeat modes, crossfade between songs, resume the last song at start.
 - Rebindable hotkeys (F9 menu, 7/8/9/0 transport, -/= volume, hold Left Alt for the cursor) and
   controller combos (hold LT + D-pad).

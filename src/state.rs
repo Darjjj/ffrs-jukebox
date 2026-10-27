@@ -130,18 +130,6 @@ impl Shared {
         self.save_config();
     }
 
-    /// Moves song `i` one place up (`-1`) or down (`1`) in `list`.
-    pub fn shift(&mut self, list: List, i: usize, delta: isize) {
-        let Some(key) = self.tracks.get(i).map(|t| t.key.clone()) else { return };
-        let Some(keys) = self.keys_mut(list) else { return };
-        let Some(pos) = keys.iter().position(|k| *k == key) else { return };
-        let to = pos as isize + delta;
-        if to >= 0 && (to as usize) < keys.len() {
-            keys.swap(pos, to as usize);
-            self.save_config();
-        }
-    }
-
     /// Moves song `from` to where song `to` is in `list`, for drag and drop;
     /// the songs between shift along by one.
     pub fn move_to(&mut self, list: List, from: usize, to: usize) {

@@ -25,7 +25,6 @@ const VOLUME_POPUP_SECS: f32 = 1.5;
 enum Action {
     Play(usize),
     Toggle(List, usize),
-    Shift(List, usize, isize),
     /// A new playlist from a song's + menu, holding that song.
     Create(Option<usize>),
     CreateNamed(String),
@@ -319,7 +318,7 @@ impl Menu {
     /// songs in order, numbered. Your own playlists reorder by dragging a
     /// song's number onto another song.
     #[allow(clippy::too_many_arguments)]
-    fn playlist_page<R: Fn(&state::Shared, usize, &mut Vec<Action>)>(
+    fn playlist_page<R: Fn(&state::Shared, usize, &mut Vec<Action>, Option<List>)>(
         &mut self,
         ui: &Ui,
         s: &state::Shared,
@@ -340,7 +339,7 @@ impl Menu {
             }
             _ => return,
         };
-        if ui.small_button("\u{2039} Playlists") {
+        if ui.small_button("\u{2190} Playlists") {
             self.open_list = None;
         }
         {
@@ -369,21 +368,9 @@ impl Menu {
                 ui.text_disabled("Empty. Use + on any song, or right-click it, to add it here.");
             }
             for (n, &i) in songs.iter().enumerate() {
-                // The number doubles as the drag handle.
-                {
-                    let _bg = ui.push_style_color(StyleColor::Button, [0.0; 4]);
-                    let _edge = ui.push_style_color(StyleColor::Border, [0.0; 4]);
-                    let _text = ui.push_style_color(StyleColor::Text, DIM);
-                    ui.small_button(format!("{:>2}##num{i}", n + 1));
-                }
+                ui.align_text_to_frame_padding();
+                ui.text_disabled(format!("{:>2}", n + 1));
                 if let Some(list) = list {
-                    if ui.is_item_hovered() {
-                        ui.tooltip_text("Drag onto another song to move it there");
-                    }
-                    if let Some(tip) = ui.drag_drop_source_config("JUKEBOX_SONG").begin_payload(i) {
-                        ui.text(&s.tracks[i].title);
-                        tip.end();
-                    }
                     ui.same_line();
                     if ui.small_button(format!("{}##rm{i}", theme::CLOSE_SMALL)) {
                         actions.push(Action::Toggle(list, i));
@@ -393,13 +380,7 @@ impl Menu {
                     }
                 }
                 ui.same_line();
-                row(s, i, actions);
-                if let (Some(list), Some(target)) = (list, ui.drag_drop_target()) {
-                    if let Some(Ok(drop)) = target.accept_payload::<usize, _>("JUKEBOX_SONG", DragDropFlags::empty()) {
-                        actions.push(Action::MoveTo(list, drop.data, i));
-                    }
-                    target.pop();
-                }
+                row(s, i, actions, list);
             }
         });
     }
@@ -1033,7 +1014,7 @@ impl ImguiRenderLoop for Menu {
                 let mut actions = Vec::new();
                 // One song row: favorite checkbox, add-to-playlist button,
                 // then the clickable title.
-                let row = |s: &state::Shared, i: usize, actions: &mut Vec<Action>| {
+                let row = |s: &state::Shared, i: usize, actions: &mut Vec<Action>, drag: Option<List>| {
                     let fav = s.contains(List::Favorites, i);
                     {
                         let _text = ui.push_style_color(StyleColor::Text, if fav { ACCENT } else { DIM });
@@ -1128,6 +1109,21 @@ impl ImguiRenderLoop for Menu {
                     if ui.selectable_config(label).build() {
                         actions.push(Action::Play(i));
                     }
+                    // In a list you order yourself, a song is dragged by its
+                    // title onto another song to move it there; a click still
+                    // plays it.
+                    if let Some(list) = drag {
+                        if let Some(tip) = ui.drag_drop_source_config("JUKEBOX_SONG").begin_payload(i) {
+                            ui.text(&s.tracks[i].title);
+                            tip.end();
+                        }
+                        if let Some(target) = ui.drag_drop_target() {
+                            if let Some(Ok(drop)) = target.accept_payload::<usize, _>("JUKEBOX_SONG", DragDropFlags::empty()) {
+                                actions.push(Action::MoveTo(list, drop.data, i));
+                            }
+                            target.pop();
+                        }
+                    }
                     if ui.is_item_hovered() {
                         hovered_now.set(Some(i));
                     }
@@ -1146,14 +1142,6 @@ impl ImguiRenderLoop for Menu {
                         if !needle.is_empty() && !s.tracks[i].title.to_lowercase().contains(&needle) {
                             continue;
                         }
-                        if ui.small_button(format!("^##up{i}")) {
-                            actions.push(Action::Shift(list, i, -1));
-                        }
-                        ui.same_line();
-                        if ui.small_button(format!("v##dn{i}")) {
-                            actions.push(Action::Shift(list, i, 1));
-                        }
-                        ui.same_line();
                         if let List::Custom(_) = list {
                             if ui.small_button(format!("x##rm{i}")) {
                                 actions.push(Action::Toggle(list, i));
@@ -1163,7 +1151,7 @@ impl ImguiRenderLoop for Menu {
                             }
                             ui.same_line();
                         }
-                        row(s, i, actions);
+                        row(s, i, actions, Some(list));
                     }
                 };
                 let list_height = [0.0, -ui.frame_height_with_spacing()];
@@ -1268,7 +1256,7 @@ impl ImguiRenderLoop for Menu {
                                 if !needle.is_empty() && !t.title.to_lowercase().contains(&needle) {
                                     continue;
                                 }
-                                row(&s, i, &mut actions);
+                                row(&s, i, &mut actions, None);
                             }
                         });
                     }
@@ -1290,7 +1278,7 @@ impl ImguiRenderLoop for Menu {
                                     actions.push(Action::Toggle(List::Hidden, i));
                                 }
                                 ui.same_line();
-                                row(&s, i, &mut actions);
+                                row(&s, i, &mut actions, None);
                             }
                         });
                         // Rarely needed, so it lives here rather than over the
@@ -1319,7 +1307,6 @@ impl ImguiRenderLoop for Menu {
                     match action {
                         Action::Play(i) => s.push(Command::Play(i)),
                         Action::Toggle(list, i) => s.toggle(list, i),
-                        Action::Shift(list, i, d) => s.shift(list, i, d),
                         Action::Create(song) => {
                             let p = s.create_playlist("New playlist");
                             if let Some(i) = song {
