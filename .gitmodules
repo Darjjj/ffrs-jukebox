@@ -1,0 +1,3 @@
+[submodule "deps/final-fantasy-resonance-fix"]
+	path = deps/final-fantasy-resonance-fix
+	url = https://github.com/PolarWizard/final-fantasy-resonance-fix

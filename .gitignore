@@ -1,0 +1,8 @@
+/target
+# Showcase recordings and working files (several GB); the finished
+# thumbnail lives in docs/.
+/showcase
+/release
+*.log
+*.toml.bad
+*.toml.tmp
