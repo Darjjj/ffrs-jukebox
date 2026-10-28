@@ -14,12 +14,16 @@ use crate::state::{self, Command, List};
 use crate::theme::{self, ACCENT, DIM, Icon};
 
 const TOAST_SECS: f32 = 4.0;
+/// How long after a battle starts or ends the now-playing toast waits.
+const BATTLE_TOAST_DELAY: f32 = 0.4;
+/// Track changes this soon after a battle starts or ends come from the
+/// battle playlist swap.
+const BATTLE_SWAP_SECS: f32 = 2.0;
 /// How long a volume key is held before it repeats, and how fast then.
 const VOLUME_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 const VOLUME_REPEAT: std::time::Duration = std::time::Duration::from_millis(70);
 /// How long the volume popup stays after the last step.
 const VOLUME_POPUP_SECS: f32 = 1.5;
-/// How long a volume key is held before it repeats, and how fast then. VOLUME_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(400); VOLUME_REPEAT: std::time::Duration = std::time::Duration::from_millis(70);
 
 /// What a click in the menu asked for, applied after the window is drawn.
 enum Action {
@@ -79,6 +83,11 @@ pub struct Menu {
     focus_name: bool,
     toast_serial: u64,
     toast_since: Option<Instant>,
+    /// Whether the last frame was in a battle, and when that last changed,
+    /// for the battle start/end toast.
+    was_battle: bool,
+    battle_changed: Option<Instant>,
+    battle_toast_due: bool,
     heading: Option<FontId>,
     song_font: Option<FontId>,
     small_font: Option<FontId>,
@@ -123,6 +132,9 @@ impl Menu {
             focus_name: false,
             toast_serial: 0,
             toast_since: None,
+            was_battle: false,
+            battle_changed: None,
+            battle_toast_due: false,
             heading: None,
             song_font: None,
             small_font: None,
@@ -466,6 +478,12 @@ impl Menu {
                 if ui.is_item_hovered() {
                     ui.tooltip_text("Winning a battle pauses the jukebox for the game's own\nvictory fanfare, then picks up again once it's over.");
                 }
+                if ui.checkbox("Show the song on battle start and end", &mut s.config.battle_toast) {
+                    changed = true;
+                }
+                if ui.is_item_hovered() {
+                    ui.tooltip_text("Pops the now-playing note in the top right when a\nbattle starts or ends, while the jukebox is playing.");
+                }
             });
         if changed {
             s.save_config();
@@ -485,7 +503,7 @@ impl Menu {
     /// panel that keeps its own place on screen. The title wraps onto as
     /// many lines as it needs, so the whole of it can be read.
     fn mini(&mut self, ui: &Ui, s: &mut state::Shared, title: &Option<String>) {
-        let w = 232.0 * self.scale;
+        let w = 256.0 * self.scale;
         let [dw, dh] = ui.io().display_size;
         let pos = s.config.mini_pos.unwrap_or([dw - w - 40.0, 40.0]);
         let pos = [pos[0].clamp(0.0, (dw - 100.0).max(0.0)), pos[1].clamp(0.0, (dh - 60.0).max(0.0))];
@@ -520,7 +538,11 @@ impl Menu {
                 let _font = small_font.map(|f| ui.push_font(f));
                 progress(ui, s);
                 let fh = ui.frame_height();
-                transport(ui, s, None, [fh * 1.05, fh * 1.05]);
+                let b = transport(ui, s, None, [fh * 1.05, fh * 1.05]);
+                ui.same_line();
+                if repeat(ui, s, b) {
+                    s.save_config();
+                }
                 // Volume, expand and hide sit at the end of the transport row.
                 ui.same_line();
                 let volume = s.config.volume;
@@ -738,6 +760,20 @@ fn transport(ui: &Ui, s: &mut state::Shared, font: Option<FontId>, b: [f32; 2]) 
     b
 }
 
+/// The repeat button, which steps through off, playlist and song. Returns
+/// whether it was clicked.
+fn repeat(ui: &Ui, s: &mut state::Shared, b: [f32; 2]) -> bool {
+    let (on, one) = (s.config.repeat != Repeat::Off, s.config.repeat == Repeat::One);
+    let clicked = theme::repeat_button(ui, "##repeat", on, one, b);
+    if clicked {
+        s.config.repeat = s.config.repeat.next();
+    }
+    if ui.is_item_hovered() {
+        ui.tooltip_text(format!("{}\nClick to switch: off, playlist, song.", s.config.repeat.label()));
+    }
+    clicked
+}
+
 fn header_button_size(ui: &Ui) -> f32 {
     ui.frame_height() * 1.05
 }
@@ -801,9 +837,29 @@ impl ImguiRenderLoop for Menu {
         self.poll_keys(typing);
 
         let mut s = state::lock();
+        let battle = s.scene == crate::config::Scene::Battle;
+        if battle != self.was_battle {
+            self.was_battle = battle;
+            self.battle_changed = Some(Instant::now());
+            self.battle_toast_due = s.config.battle_toast;
+        }
+        let since_battle = self.battle_changed.map_or(f32::MAX, |t| t.elapsed().as_secs_f32());
         if s.track_serial != self.toast_serial {
             self.toast_serial = s.track_serial;
-            self.toast_since = Some(Instant::now());
+            // Swapping to the battle playlist and back is a track change too;
+            // with the battle toast off, those stay quiet.
+            if s.config.battle_toast || since_battle > BATTLE_SWAP_SECS {
+                self.toast_since = Some(Instant::now());
+            }
+        }
+        // Battle start or end: the player settles which song plays (or holds
+        // for the game's music) a tick or two after the scene changes, so the
+        // toast waits a moment and only shows if the jukebox is playing.
+        if self.battle_toast_due && since_battle >= BATTLE_TOAST_DELAY {
+            self.battle_toast_due = false;
+            if s.playing && !s.held {
+                self.toast_since = Some(Instant::now());
+            }
         }
         let title = s.current.and_then(|i| s.tracks.get(i)).map(|t| t.title.clone());
 
@@ -928,6 +984,8 @@ impl ImguiRenderLoop for Menu {
                 progress(ui, &mut s);
                 let b = transport(ui, &mut s, song_font, [ui.frame_height() * 1.8, ui.frame_height() * 1.35]);
                 ui.same_line();
+                config_changed |= repeat(ui, &mut s, b);
+                ui.same_line();
                 let shuffle_w = ui.calc_text_size("Shuffle")[0] + ui.frame_height();
                 config_changed |= theme::toggle(ui, "Shuffle", &mut s.config.shuffle, [shuffle_w, b[1]]);
                 ui.spacing();
@@ -965,13 +1023,6 @@ impl ImguiRenderLoop for Menu {
                 }
                 if toggled {
                     s.config.play_in = Some(play);
-                    config_changed = true;
-                }
-                let mut repeat = Repeat::ALL.iter().position(|r| *r == s.config.repeat).unwrap_or(0);
-                let labels: Vec<_> = Repeat::ALL.iter().map(|r| r.label()).collect();
-                field("Repeat");
-                if theme::combo(ui, "##repeat", &mut repeat, &labels) {
-                    s.config.repeat = Repeat::ALL[repeat];
                     config_changed = true;
                 }
                 let choices = s.play_from_choices();

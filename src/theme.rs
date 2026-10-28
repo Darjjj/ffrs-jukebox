@@ -338,6 +338,51 @@ pub fn icon_button(ui: &Ui, id: &str, icon: Icon, size: f32) -> bool {
     clicked
 }
 
+/// The repeat button, sized like the transport buttons: a near-full circle
+/// ending in an arrowhead, dimmed when off, lit for the playlist, and lit with
+/// a small 1 inside for one song.
+pub fn repeat_button(ui: &Ui, id: &str, on: bool, one: bool, size: [f32; 2]) -> bool {
+    let p = ui.cursor_screen_pos();
+    let (bg, col) = if on { ([0.35, 0.68, 0.84, 0.75], WHITE) } else { ([0.0, 0.0, 0.0, 0.0], DIM) };
+    let clicked = {
+        let _bg = ui.push_style_color(StyleColor::Button, bg);
+        ui.button_with_size(id, size)
+    };
+    let draw = ui.get_window_draw_list();
+    let (cx, cy) = (p[0] + size[0] * 0.5, p[1] + size[1] * 0.5);
+    let r = size[1] * 0.24;
+    let t = (size[1] * 0.07).max(1.4);
+    // Clockwise from the right, leaving a gap at the top right for the head.
+    let (start, end) = (0.1 * std::f32::consts::PI, 1.7 * std::f32::consts::PI);
+    let pts: Vec<[f32; 2]> = (0..=24)
+        .map(|k| {
+            let a = start + (end - start) * k as f32 / 24.0;
+            [cx + r * a.cos(), cy + r * a.sin()]
+        })
+        .collect();
+    draw.add_polyline(pts, col).thickness(t).build();
+    // The arrowhead, pointing on along the circle.
+    let (s, c) = end.sin_cos();
+    let tip = [cx + r * c - s * r * 0.55, cy + r * s + c * r * 0.55];
+    let (w, back) = (r * 0.42, r * 0.05);
+    draw.add_triangle(
+        [cx + (r + w) * c + s * back, cy + (r + w) * s - c * back],
+        [cx + (r - w) * c + s * back, cy + (r - w) * s - c * back],
+        tip,
+        col,
+    )
+    .filled(true)
+    .build();
+    // A small 1, drawn as lines, tucked against the circle's bottom right.
+    if one {
+        let (h, x, y) = (r * 0.38, cx + r * 1.3, cy + r * 0.8);
+        let tt = t * 0.75;
+        draw.add_line([x, y - h], [x, y + h], col).thickness(tt).build();
+        draw.add_line([x, y - h], [x - h * 0.6, y - h * 0.45], col).thickness(tt).build();
+    }
+    clicked
+}
+
 /// The double-diamond cursor, centred on `at`.
 pub fn cursor(ui: &Ui, at: [f32; 2], size: f32) {
     let [x, y] = at;

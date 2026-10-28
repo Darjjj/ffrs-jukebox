@@ -18,8 +18,10 @@ music. An in-game menu in the game's own style, a mini player, hotkeys and contr
   picks up where it left off.
 - **Victory fanfare.** Winning a battle fades the jukebox out for the game's own fanfare, then picks up
   your exploring song again (a setting, on by default).
+- **Battle popup.** The now-playing popup shows the current song when a battle starts and ends (a setting,
+  on by default).
 - **Favorites, playlists, hide and rename** any song, from a right-click menu.
-- **Shuffle without repeats**, repeat song or playlist, **crossfade** between songs, and **resume** the last
+- **Shuffle without repeats**, a one-click **repeat** button (off, playlist, song), **crossfade** between songs, and **resume** the last
   song where you left it when the game starts.
 - **Mini player** for while you explore, with volume on the mouse wheel.
 - **Hotkeys and controller combos**, all rebindable.

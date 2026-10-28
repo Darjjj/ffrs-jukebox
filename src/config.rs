@@ -91,13 +91,20 @@ pub enum Repeat {
 }
 
 impl Repeat {
-    pub const ALL: [Repeat; 3] = [Repeat::Off, Repeat::All, Repeat::One];
-
     pub fn label(self) -> &'static str {
         match self {
-            Repeat::Off => "Off",
-            Repeat::All => "Playlist",
-            Repeat::One => "Track",
+            Repeat::Off => "Repeat off",
+            Repeat::All => "Repeat playlist",
+            Repeat::One => "Repeat song",
+        }
+    }
+
+    /// The repeat button's next setting: off, playlist, song, then off again.
+    pub fn next(self) -> Repeat {
+        match self {
+            Repeat::Off => Repeat::All,
+            Repeat::All => Repeat::One,
+            Repeat::One => Repeat::Off,
         }
     }
 }
@@ -178,6 +185,8 @@ pub struct Config {
     pub resume_on_start: bool,
     /// Step aside for the game's victory fanfare after a won battle.
     pub victory_fanfare: bool,
+    /// Pop the now-playing toast when a battle starts or ends.
+    pub battle_toast: bool,
     /// Hold Left Trigger and press the D-pad: left previous, right next, up
     /// play/pause, down stop.
     pub controller: bool,
@@ -252,6 +261,7 @@ impl Default for Config {
             crossfade_secs: 2.0,
             resume_on_start: true,
             victory_fanfare: true,
+            battle_toast: true,
             controller: true,
             loop_minutes: 3.0,
             titles: BTreeMap::new(),

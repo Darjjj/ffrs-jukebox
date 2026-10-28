@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0 - 2026-10-27
+
+- The now-playing popup also shows the current song when a battle starts and when it ends. A new
+  setting, "Show the song on battle start and end" (on by default), turns it off.
+- Thanks to Obsidianpunchbowl for suggesting the battle popup.
+- Repeat is now a button next to Shuffle, in the full menu and the mini player: click it to switch
+  between off, repeat playlist and repeat song (shown with a small 1).
+
 ## 1.2.0 - 2026-10-27
 
 - New setting, "Let the victory fanfare play" (on by default): winning a battle fades the jukebox out
