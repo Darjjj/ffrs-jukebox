@@ -187,6 +187,14 @@ pub struct Config {
     pub victory_fanfare: bool,
     /// Pop the now-playing toast when a battle starts or ends.
     pub battle_toast: bool,
+    /// Leave boss battles to the game's own music.
+    pub boss_game_music: bool,
+    /// Shuffle for the battle music list, apart from the main Shuffle.
+    pub battle_shuffle: bool,
+    /// Tuck the mini player away during cutscenes; it comes back after.
+    pub mini_hide_in_cutscenes: bool,
+    /// Tuck the mini player away while talking to someone or reading a sign.
+    pub mini_hide_while_talking: bool,
     /// Hold Left Trigger and press the D-pad: left previous, right next, up
     /// play/pause, down stop.
     pub controller: bool,
@@ -233,6 +241,9 @@ pub struct Config {
     pub menu_pos: Option<[f32; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub menu_size: Option<[f32; 2]>,
+    /// The settings window's size, once it has been resized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_size: Option<[f32; 2]>,
     /// Where the mini player was last left.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mini_pos: Option<[f32; 2]>,
@@ -262,6 +273,10 @@ impl Default for Config {
             resume_on_start: true,
             victory_fanfare: true,
             battle_toast: true,
+            boss_game_music: true,
+            battle_shuffle: true,
+            mini_hide_in_cutscenes: true,
+            mini_hide_while_talking: false,
             controller: true,
             loop_minutes: 3.0,
             titles: BTreeMap::new(),
@@ -278,6 +293,7 @@ impl Default for Config {
             checked_build: String::new(),
             menu_pos: None,
             menu_size: None,
+            settings_size: None,
             mini_pos: None,
         }
     }
@@ -518,5 +534,16 @@ mod tests {
         // Configs saved before playlists existed still load.
         let old: Config = toml::from_str("playlist = \"Favorites\"\nmenu_key = 120").unwrap();
         assert_eq!(old.playlist, Playlist::Favorites);
+    }
+
+    #[test]
+    fn a_1_3_0_config_gets_the_new_settings_at_their_defaults() {
+        let old: Config = toml::from_str("shuffle = false\nbattle_toast = false\nvictory_fanfare = true").unwrap();
+        assert!(!old.shuffle && !old.battle_toast);
+        assert!(old.boss_game_music && old.battle_shuffle && old.mini_hide_in_cutscenes);
+        assert!(!old.mini_hide_while_talking);
+        assert_eq!(old.settings_size, None);
+        // An unset window size isn't written out.
+        assert!(!toml::to_string(&old).unwrap().contains("settings_size"));
     }
 }

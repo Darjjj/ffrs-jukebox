@@ -78,6 +78,10 @@ pub struct Shared {
     pub playing: bool,
     /// Playing, but held because the current scene is outside the mode.
     pub held: bool,
+    /// The current battle is a boss battle.
+    pub boss: bool,
+    /// Talking to someone or reading a sign (not a story scene).
+    pub talking: bool,
     pub scene: Scene,
     pub position: f32,
     pub duration: Option<f32>,

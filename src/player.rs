@@ -89,6 +89,9 @@ pub struct Player {
     mute: BgmMute,
     /// Tracks played, for Previous in shuffle.
     history: Vec<usize>,
+    /// The other side's history, swapped in as a battle starts or ends, so
+    /// Previous stays within the battle music or the exploring music.
+    other_history: Vec<usize>,
     volume: f32,
     /// A cut-off cue waiting to be started again: track, attempt, when.
     retry: Option<(usize, u8, Instant)>,
@@ -99,10 +102,9 @@ pub struct Player {
     check: Option<SongCheck>,
     /// The volume actually applied, catching up with the setting.
     ramped: f32,
-    /// Shuffle's remaining songs, drawn without repeats until it runs out,
-    /// and the playlist it was dealt from.
-    bag: Vec<usize>,
-    bag_of: Vec<usize>,
+    /// Shuffle's remaining songs, drawn without repeats until each runs out:
+    /// one deal per side (battle or not) and playlist.
+    bags: std::collections::HashMap<(bool, Vec<usize>), Vec<usize>>,
     /// Playing from the battle music, and the exploring song (track, position)
     /// to pick up again once the battle ends.
     in_battle: bool,
@@ -135,13 +137,13 @@ impl Player {
             now: None,
             mute: BgmMute::default(),
             history: Vec::new(),
+            other_history: Vec::new(),
             volume: -1.0,
             retry: None,
             auto: false,
             check: None,
             ramped: 0.0,
-            bag: Vec::new(),
-            bag_of: Vec::new(),
+            bags: std::collections::HashMap::new(),
             in_battle: false,
             battle_resume: None,
             crossfade_next: false,
@@ -175,16 +177,17 @@ impl Player {
 
     /// Switches to the battle music as a battle starts and back to the
     /// exploring song, where it left off, once it ends.
-    fn follow_battle(&mut self, game: &mut Game, scene: crate::config::Scene, play_in: crate::config::PlayIn) {
+    fn follow_battle(&mut self, game: &mut Game, scene: crate::config::Scene, play_in: crate::config::PlayIn, boss_held: bool) {
         let (has_battle_list, playing) = {
             let s = state::lock();
             (s.config.battle_playlist.is_some(), s.playing)
         };
-        let battle = scene == crate::config::Scene::Battle && play_in.covers(scene) && has_battle_list;
+        let battle = scene == crate::config::Scene::Battle && play_in.covers(scene) && has_battle_list && !boss_held;
         if battle == self.in_battle {
             return;
         }
         self.in_battle = battle;
+        std::mem::swap(&mut self.history, &mut self.other_history);
         if battle {
             if !playing {
                 return;
@@ -319,13 +322,15 @@ impl Player {
         refresh_game_tracks(game);
         let scene = game.scene();
 
-        let (commands, play_in, fanfare_setting, volume, level_db, cf) = {
+        let (commands, play_in, fanfare_setting, boss_setting, volume, level_db, cf) = {
             let mut s = state::lock();
             s.scene = scene;
+            s.talking = crate::game::talking();
             (
                 s.commands.drain(..).collect::<Vec<_>>(),
                 s.config.play_in(),
                 s.config.victory_fanfare,
+                s.config.boss_game_music,
                 s.config.volume,
                 s.config.my_music_level_db,
                 s.config.crossfade_secs.max(0.0),
@@ -347,7 +352,11 @@ impl Player {
             }
         }
         self.resume_last(game);
-        self.follow_battle(game, scene, play_in);
+        // Boss battles can keep the game's own music, as the developers
+        // scored them; the battle music isn't started for them either.
+        let boss = scene == crate::config::Scene::Battle && game.boss_battle();
+        let boss_held = boss && boss_setting;
+        self.follow_battle(game, scene, play_in, boss_held);
         self.run_check(game);
         self.fade_files();
 
@@ -448,7 +457,7 @@ impl Player {
         self.after_fanfare = in_battle_scene && (self.after_fanfare || fanfare);
         fanfare |= self.after_fanfare;
         crate::log_change("fanfare", format!("player: victory fanfare playing={fanfare}"));
-        let covered = play_in.covers(scene) && !fanfare;
+        let covered = play_in.covers(scene) && !fanfare && !boss_held;
         // The song fades out under the fanfare rather than stopping dead,
         // and fades back in after it.
         let step = self.duck_at.elapsed().as_secs_f32() / FANFARE_FADE;
@@ -492,6 +501,7 @@ impl Player {
         self.save_for_resume(game);
         let mut s = state::lock();
         s.held = playing && !covered;
+        s.boss = boss;
         s.current = self.now.as_ref().map(|(i, _)| *i).or(self.retry.map(|(i, _, _)| i));
         match &self.now {
             Some((_, Playing::Cue { id, duration, .. })) => {
@@ -577,6 +587,7 @@ impl Player {
                     self.stop(game);
                 }
                 self.history.clear();
+                self.other_history.clear();
                 let mut s = state::lock();
                 let files = state::scan_folder(&s.music_dir);
                 log::info!("player: {} files in {}", files.len(), s.music_dir.display());
@@ -608,7 +619,10 @@ impl Player {
     fn advance_from(&mut self, game: &mut Game, natural_end: bool, current: Option<usize>) {
         let (list, repeat, shuffle) = {
             let s = state::lock();
-            (s.songs_of(&self.list_now(&s), current), s.config.repeat, s.config.shuffle)
+            // A battle list has its own shuffle switch.
+            let battle_list = self.in_battle && s.config.battle_playlist.is_some();
+            let shuffle = if battle_list { s.config.battle_shuffle } else { s.config.shuffle };
+            (s.songs_of(&self.list_now(&s), current), s.config.repeat, shuffle)
         };
         let len = list.len();
         if len == 0 {
@@ -644,26 +658,23 @@ impl Player {
     /// before any comes round again. A new deal never opens with `current`.
     fn draw(&mut self, list: &[usize], current: Option<usize>) -> Option<usize> {
         use rand::seq::SliceRandom;
+        // Battle and exploring each keep their own deal per list, even when
+        // both play the same list, so neither disturbs the other.
         let mut sorted = list.to_vec();
         sorted.sort_unstable();
-        if sorted != self.bag_of {
-            self.bag_of = sorted;
-            self.bag.clear();
-        }
-        // Songs that left the list since the deal are skipped.
-        self.bag.retain(|i| list.contains(i));
-        if self.bag.is_empty() {
-            self.bag = list.to_vec();
-            self.bag.shuffle(&mut rand::thread_rng());
+        let bag = self.bags.entry((self.in_battle, sorted)).or_default();
+        if bag.is_empty() {
+            *bag = list.to_vec();
+            bag.shuffle(&mut rand::thread_rng());
             // Drawn from the end, so the current song goes to the front.
-            if let (Some(c), true) = (current, self.bag.len() > 1) {
-                if let Some(p) = self.bag.iter().position(|&i| i == c) {
-                    self.bag.remove(p);
-                    self.bag.insert(0, c);
+            if let (Some(c), true) = (current, bag.len() > 1) {
+                if let Some(p) = bag.iter().position(|&i| i == c) {
+                    bag.remove(p);
+                    bag.insert(0, c);
                 }
             }
         }
-        self.bag.pop()
+        bag.pop()
     }
 
     /// Starts song `i` as a change of song: it crossfades with the last.
@@ -812,5 +823,21 @@ mod tests {
         p.draw(&[1, 2, 3], None);
         let next = p.draw(&[8, 9], None).unwrap();
         assert!(next == 8 || next == 9);
+    }
+
+    #[test]
+    fn battle_and_exploring_shuffle_keep_separate_deals_of_one_list() {
+        let mut p = Player::new();
+        let list = vec![1, 2, 3, 4];
+        let first = p.draw(&list, None).unwrap();
+        // A whole battle deal of the same list, unaffected by the exploring one.
+        p.in_battle = true;
+        let mut battle: Vec<usize> = (0..list.len()).map(|_| p.draw(&list, None).unwrap()).collect();
+        battle.sort_unstable();
+        assert_eq!(battle, list);
+        // Back out of battle, the exploring deal carries on without `first`.
+        p.in_battle = false;
+        let rest: Vec<usize> = (0..list.len() - 1).map(|_| p.draw(&list, None).unwrap()).collect();
+        assert!(!rest.contains(&first));
     }
 }

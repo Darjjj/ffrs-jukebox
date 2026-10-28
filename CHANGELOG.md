@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.0 - 2026-10-28
+
+- Boss battles keep the game's own music, as the developers intended: a new setting, "Game music in
+  boss battles" (on by default). The status line in the menu says "Boss battle" during one.
+- Talking to townsfolk, shops, the inn, bulletin boards and the like no longer hands the music back to
+  the game; only story scenes count as cutscenes now.
+- The mini player can hide itself during cutscenes ("Hide during cutscenes", on by default) and while
+  talking ("Hide while talking", off by default), and comes back when they end.
+- Battle music has a Shuffle of its own, separate from the main Shuffle. Battle and exploring music
+  also keep separate shuffle orders and Previous histories, so neither disturbs the other.
+- The settings window is reworked into General, Battles and Controls tabs, with one On/Off switch per
+  option. It can be resized and remembers its size.
+- Works alongside PolarWizard's ultrawide fix again: the jukebox no longer hides the game function the
+  fix looks for.
+- Boss fights no longer start a battle song in the background, story scenes no longer flicker the music
+  back on between their parts, and a key waiting to be rebound stops waiting when you leave its tab.
+
 ## 1.3.0 - 2026-10-27
 
 - The now-playing popup also shows the current song when a battle starts and when it ends. A new

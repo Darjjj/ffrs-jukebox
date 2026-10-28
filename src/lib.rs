@@ -101,9 +101,24 @@ fn main(this_module: HMODULE) {
     state::init(state::Shared { config, config_path, music_dir, tracks, ..Default::default() });
     state::lock().apply_titles();
 
-    // Game-thread entry for the player: UObject::ProcessEvent.
+    // Game-thread entry for the player: inside UObject::ProcessEvent, not at its
+    // entry. The ultrawide fix finds ProcessEvent by its first 0x55 bytes, so a
+    // hook there hides it. +0x8C is the `je` both paths reach (native via the
+    // jmp at +0x87, script by falling through +0x89), and nothing jumps into
+    // its middle. Checked against the bytes first; the entry is the fallback.
     let base = unsafe { GetModuleHandleA(None) }.map(|h| h.0 as usize).unwrap_or(0);
-    let process_event = (base + sdk::config::PROCESS_EVENT) as *mut u8;
+    let entry = (base + sdk::config::PROCESS_EVENT) as *mut u8;
+    let expected: [(usize, &[u8]); 3] =
+        [(0x00, &[0x40, 0x55, 0x56, 0x57]), (0x87, &[0xEB, 0x03]), (0x8C, &[0x0F, 0x84])];
+    let inner = expected
+        .iter()
+        .all(|(at, bytes)| unsafe { std::slice::from_raw_parts(entry.add(*at), bytes.len()) } == *bytes);
+    let process_event = if inner {
+        unsafe { entry.add(0x8C) }
+    } else {
+        log::warn!("main: ProcessEvent+0x8C not as expected, hooking its entry instead");
+        entry
+    };
     match MidHook::install(process_event, |_ctx| game::on_process_event()) {
         Ok(_) => log::info!("main: ProcessEvent hooked @ {process_event:p}"),
         Err(e) => {

@@ -18,12 +18,17 @@ music. An in-game menu in the game's own style, a mini player, hotkeys and contr
   picks up where it left off.
 - **Victory fanfare.** Winning a battle fades the jukebox out for the game's own fanfare, then picks up
   your exploring song again (a setting, on by default).
+- **Boss battles keep their music.** Boss fights play the game's own music, as the developers intended
+  (a setting, on by default).
 - **Battle popup.** The now-playing popup shows the current song when a battle starts and ends (a setting,
   on by default).
+- **Keeps playing while you talk.** Townsfolk, shops, the inn and bulletin boards don't interrupt your
+  music; only story scenes count as cutscenes.
 - **Favorites, playlists, hide and rename** any song, from a right-click menu.
-- **Shuffle without repeats**, a one-click **repeat** button (off, playlist, song), **crossfade** between songs, and **resume** the last
+- **Shuffle without repeats** (battle music has a Shuffle of its own), a one-click **repeat** button (off, playlist, song), **crossfade** between songs, and **resume** the last
   song where you left it when the game starts.
-- **Mini player** for while you explore, with volume on the mouse wheel.
+- **Mini player** for while you explore, with volume on the mouse wheel. It can hide itself during
+  cutscenes and while talking.
 - **Hotkeys and controller combos**, all rebindable.
 - Steps aside on its own for pre-rendered movies that carry their own soundtrack.
 
@@ -56,8 +61,8 @@ music. An in-game menu in the game's own style, a mini player, hotkeys and contr
 | **Hold Left Alt** | Show the cursor over the mini player while exploring |
 | **Hold LT + D-pad** | ◀ previous, ▶ next, ▲ play/pause, ▼ stop |
 
-Every key can be changed in the menu's ⚙ settings, which also hold crossfade length, resume and the
-controller toggle. Hotkeys do nothing while you are typing in a text box, and only work while the game is the
+Every key can be changed in the menu's ⚙ settings (Controls tab). The General and Battles tabs hold
+crossfade length, resume, the mini player, boss music, the victory fanfare and the battle popup. Hotkeys do nothing while you are typing in a text box, and only work while the game is the
 active window.
 
 - **Your own songs:** open the My Music tab and press **Open music folder**, add files, then **Rescan folder**.

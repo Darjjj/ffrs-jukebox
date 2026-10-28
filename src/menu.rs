@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use hudhook::imgui::{
-    Condition, Context, FontId, Io, MouseButton, ProgressBar, DragDropFlags, Key, SelectableFlags, StyleColor, StyleVar, TabBarFlags, Ui, WindowHoveredFlags,
+    Condition, Context, FontId, Io, ItemHoveredFlags, MouseButton, ProgressBar, DragDropFlags, Key, SelectableFlags, StyleColor, StyleVar, TabBarFlags, Ui, WindowHoveredFlags,
     WindowFlags,
 };
 use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
@@ -97,6 +97,8 @@ pub struct Menu {
     renaming: Option<(usize, String, bool)>,
     /// The song row the mouse was on last frame.
     hovered: Option<usize>,
+    /// The mini player is up but tucked away for a cutscene.
+    mini_away: bool,
     /// The mouse was over the mini player last frame.
     mini_hovered: bool,
     /// The show-cursor key is being held.
@@ -140,6 +142,7 @@ impl Menu {
             small_font: None,
             scale: 1.0,
             hovered: None,
+            mini_away: false,
             renaming: None,
             mini_hovered: false,
             cursor_held: false,
@@ -397,17 +400,31 @@ impl Menu {
         });
     }
 
-    /// The settings window, beside the full menu: every keybind, each
-    /// changeable by clicking it and pressing the new key.
+    /// The settings window, beside the full menu, in three tabs: General,
+    /// Battles and Controls. Each option is one row, its name on the left and
+    /// an On/Off switch on the right; the details are in its tooltip.
     fn settings(&mut self, ui: &Ui, s: &mut state::Shared, at: [f32; 2]) {
         let heading = self.song_font;
+        let small_font = self.small_font;
+        let k = self.scale;
         let mut close = false;
         let mut reset = false;
         let mut changed = false;
+        let mut resized_to = None;
+        // Resizable from its corner; the size is kept for next time.
+        let size = s.config.settings_size.unwrap_or([340.0 * k, 430.0 * k]);
         ui.window("##jukebox_settings")
             .position(at, Condition::Appearing)
-            .flags(WindowFlags::NO_TITLE_BAR | WindowFlags::NO_COLLAPSE | WindowFlags::ALWAYS_AUTO_RESIZE)
+            .size(size, Condition::Appearing)
+            .size_constraints([270.0 * k, 200.0 * k], [10_000.0, 10_000.0])
+            .flags(WindowFlags::NO_TITLE_BAR | WindowFlags::NO_COLLAPSE)
             .build(|| {
+                if !ui.is_mouse_down(MouseButton::Left) {
+                    let z = ui.window_size();
+                    if s.config.settings_size.is_none_or(|a| (a[0] - z[0]).abs() > 0.5 || (a[1] - z[1]).abs() > 0.5) {
+                        resized_to = Some(z);
+                    }
+                }
                 theme::backdrop(ui);
                 {
                     let _font = heading.map(|f| ui.push_font(f));
@@ -418,73 +435,113 @@ impl Menu {
                     close = true;
                 }
                 theme::heading_rule(ui);
-                ui.text_disabled("Keys");
-                let label_w = Bind::ALL.iter().map(|b| ui.calc_text_size(b.label())[0]).fold(0.0, f32::max)
-                    + ui.frame_height();
-                let key_w = ui.calc_text_size("Press a key...")[0] + ui.frame_height() * 2.0;
-                for bind in Bind::ALL {
+                let tab = |name: &str| {
+                    let _font = small_font.map(|f| ui.push_font(f));
+                    ui.tab_item(name)
+                };
+                let Some(_bar) = ui.tab_bar("settings_tabs") else { return };
+                if let Some(_tab) = tab("General") {
+                    section(ui, "Playback");
+                    // The crossfade slider takes the switch's place, wider.
                     ui.align_text_to_frame_padding();
-                    ui.text(bind.label());
-                    ui.same_line_with_pos(label_w);
-                    let waiting = self.capturing == Some(bind);
-                    let text = if waiting { "Press a key...".to_string() } else { keys::name(s.config.key(bind)) };
-                    let _lit = waiting.then(|| ui.push_style_color(StyleColor::Button, [0.35, 0.68, 0.84, 0.75]));
-                    if ui.button_with_size(format!("{text}##bind{bind:?}"), [key_w, 0.0]) {
-                        self.capturing = if waiting { None } else { Some(bind) };
+                    ui.text("Crossfade");
+                    let label_hovered = ui.is_item_hovered();
+                    let slider_w = (ui.frame_height() * 6.0)
+                        .min(ui.content_region_avail()[0] - ui.item_rect_size()[0] - ui.clone_style().item_spacing[0]);
+                    ui.same_line_with_pos(ui.window_content_region_max()[0] - slider_w);
+                    ui.set_next_item_width(slider_w);
+                    let mut cf = s.config.crossfade_secs;
+                    if ui.slider_config("##crossfade", 0.0, 8.0).display_format("%.0f s").build(&mut cf) {
+                        s.config.crossfade_secs = cf.round();
+                        changed = true;
                     }
+                    if label_hovered || ui.is_item_hovered() {
+                        ui.tooltip_text("How long one song blends into the next. 0 for a straight cut.");
+                    }
+                    changed |= option(
+                        ui,
+                        "Resume last song at start",
+                        "When the game starts, carry on with the song you were\nplaying last time, where you left it. Stop clears it.",
+                        &mut s.config.resume_on_start,
+                    );
+                    section(ui, "Mini player");
+                    changed |= option(
+                        ui,
+                        "Hide during cutscenes",
+                        "Tucks the mini player away for story events and movies,\nand brings it back when they end.",
+                        &mut s.config.mini_hide_in_cutscenes,
+                    );
+                    changed |= option(
+                        ui,
+                        "Hide while talking",
+                        "Tucks the mini player away while you talk to townsfolk,\nshops or read a sign, and brings it back after.",
+                        &mut s.config.mini_hide_while_talking,
+                    );
                 }
-                ui.spacing();
-                ui.text_disabled("Click a key, then press the new one.\nEsc cancels, Delete unbinds.");
-                ui.spacing();
-                if ui.button("Reset to defaults") {
-                    reset = true;
+                if let Some(_tab) = tab("Battles") {
+                    section(ui, "Music");
+                    changed |= option(
+                        ui,
+                        "Game music in boss battles",
+                        "Boss battles keep the game's own music, as the\ndevelopers intended, even with Battles switched on.",
+                        &mut s.config.boss_game_music,
+                    );
+                    changed |= option(
+                        ui,
+                        "Let the victory fanfare play",
+                        "Winning a battle fades the jukebox out for the game's own\nvictory fanfare, then picks up again once it's over.",
+                        &mut s.config.victory_fanfare,
+                    );
+                    section(ui, "Popup");
+                    changed |= option(
+                        ui,
+                        "Show the song on battle start and end",
+                        "Pops the now-playing note in the top right when a\nbattle starts or ends, while the jukebox is playing.",
+                        &mut s.config.battle_toast,
+                    );
                 }
-
-                ui.spacing();
-                ui.separator();
-                ui.text_disabled("Controller");
-                if ui.checkbox("Hold LT + D-pad", &mut s.config.controller) {
-                    changed = true;
-                }
-                if ui.is_item_hovered() {
-                    ui.tooltip_text(
+                let mut on_controls = false;
+                if let Some(_tab) = tab("Controls") {
+                    on_controls = true;
+                    section(ui, "Keys");
+                    let label_w = Bind::ALL.iter().map(|b| ui.calc_text_size(b.label())[0]).fold(0.0, f32::max)
+                        + ui.frame_height();
+                    let left = ui.cursor_pos()[0];
+                    let key_w = ui.window_content_region_max()[0] - left - label_w;
+                    for bind in Bind::ALL {
+                        ui.align_text_to_frame_padding();
+                        ui.text(bind.label());
+                        ui.same_line_with_pos(left + label_w);
+                        let waiting = self.capturing == Some(bind);
+                        let text = if waiting { "Press a key...".to_string() } else { keys::name(s.config.key(bind)) };
+                        let _lit = waiting.then(|| ui.push_style_color(StyleColor::Button, [0.35, 0.68, 0.84, 0.75]));
+                        if ui.button_with_size(format!("{text}##bind{bind:?}"), [key_w, 0.0]) {
+                            self.capturing = if waiting { None } else { Some(bind) };
+                        }
+                    }
+                    ui.text_disabled("Click a key, then press the new one.\nEsc cancels, Delete unbinds.");
+                    if ui.button("Reset keys to defaults") {
+                        reset = true;
+                    }
+                    section(ui, "Controller");
+                    changed |= option(
+                        ui,
+                        "Hold LT + D-pad",
                         "Hold Left Trigger and press the D-pad:\n\
                          Left previous, Right next, Up play/pause, Down stop.\n\
                          The game still sees those buttons too.",
+                        &mut s.config.controller,
                     );
                 }
-
-                ui.spacing();
-                ui.separator();
-                ui.text_disabled("Playback");
-                let mut cf = s.config.crossfade_secs;
-                ui.set_next_item_width(key_w + label_w - ui.calc_text_size("Crossfade")[0] - ui.frame_height());
-                if ui.slider_config("Crossfade", 0.0, 8.0).display_format("%.0f s").build(&mut cf) {
-                    s.config.crossfade_secs = cf.round();
-                    changed = true;
-                }
-                if ui.is_item_hovered() {
-                    ui.tooltip_text("How long one song blends into the next. 0 for a straight cut.");
-                }
-                if ui.checkbox("Resume last song at start", &mut s.config.resume_on_start) {
-                    changed = true;
-                }
-                if ui.is_item_hovered() {
-                    ui.tooltip_text("When the game starts, carry on with the song you were\nplaying last time, where you left it. Stop clears it.");
-                }
-                if ui.checkbox("Let the victory fanfare play", &mut s.config.victory_fanfare) {
-                    changed = true;
-                }
-                if ui.is_item_hovered() {
-                    ui.tooltip_text("Winning a battle pauses the jukebox for the game's own\nvictory fanfare, then picks up again once it's over.");
-                }
-                if ui.checkbox("Show the song on battle start and end", &mut s.config.battle_toast) {
-                    changed = true;
-                }
-                if ui.is_item_hovered() {
-                    ui.tooltip_text("Pops the now-playing note in the top right when a\nbattle starts or ends, while the jukebox is playing.");
+                // A key waiting to be rebound stops waiting once its tab is left.
+                if !on_controls {
+                    self.capturing = None;
                 }
             });
+        if let Some(z) = resized_to {
+            s.config.settings_size = Some(z);
+            changed = true;
+        }
         if changed {
             s.save_config();
         }
@@ -774,6 +831,35 @@ fn repeat(ui: &Ui, s: &mut state::Shared, b: [f32; 2]) -> bool {
     clicked
 }
 
+/// A small heading over a group of settings, with a little room above it.
+fn section(ui: &Ui, title: &str) {
+    ui.spacing();
+    ui.text_disabled(title);
+}
+
+/// One settings row: the name on the left and an On/Off switch at the right
+/// edge, with `tip` shown over either. Returns whether it was switched.
+fn option(ui: &Ui, label: &str, tip: &str, on: &mut bool) -> bool {
+    let w = ui.frame_height() * 2.4;
+    let right = ui.window_content_region_max()[0];
+    let gap = ui.clone_style().item_spacing[0];
+    ui.align_text_to_frame_padding();
+    {
+        // A long name wraps onto a second line rather than running under
+        // the switch when the window is narrow.
+        let _wrap = ui.push_text_wrap_pos_with_pos(right - w - gap);
+        ui.text(label);
+    }
+    let label_hovered = ui.is_item_hovered();
+    ui.same_line_with_pos(right - w);
+    let text = if *on { "On" } else { "Off" };
+    let switched = theme::toggle(ui, &format!("{text}##{label}"), on, [w, 0.0]);
+    if label_hovered || ui.is_item_hovered() {
+        ui.tooltip_text(tip);
+    }
+    switched
+}
+
 fn header_button_size(ui: &Ui) -> f32 {
     ui.frame_height() * 1.05
 }
@@ -826,7 +912,8 @@ impl ImguiRenderLoop for Menu {
         // cursor, so one is drawn only while the mouse is over the player or
         // the show-cursor key (Left Alt) is held.
         ctx.io_mut().mouse_draw_cursor =
-            self.view == View::Full || (self.view == View::Mini && (self.mini_hovered || self.cursor_held));
+            self.view == View::Full
+                || (self.view == View::Mini && !self.mini_away && (self.mini_hovered || self.cursor_held));
     }
 
     fn render(&mut self, ui: &mut Ui) {
@@ -847,8 +934,9 @@ impl ImguiRenderLoop for Menu {
         if s.track_serial != self.toast_serial {
             self.toast_serial = s.track_serial;
             // Swapping to the battle playlist and back is a track change too;
-            // with the battle toast off, those stay quiet.
-            if s.config.battle_toast || since_battle > BATTLE_SWAP_SECS {
+            // those stay quiet, and the battle toast below speaks for them
+            // (or not, when it's off or the game's music has the battle).
+            if since_battle > BATTLE_SWAP_SECS {
                 self.toast_since = Some(Instant::now());
             }
         }
@@ -864,7 +952,16 @@ impl ImguiRenderLoop for Menu {
         let title = s.current.and_then(|i| s.tracks.get(i)).map(|t| t.title.clone());
 
         if self.view == View::Mini {
-            self.mini(ui, &mut s, &title);
+            // Story events and movies get the screen to themselves; the
+            // player comes back when they end.
+            let cutscene = matches!(s.scene, crate::config::Scene::Event | crate::config::Scene::Movie);
+            self.mini_away = (s.config.mini_hide_in_cutscenes && cutscene)
+                || (s.config.mini_hide_while_talking && s.talking);
+            if self.mini_away {
+                self.mini_hovered = false;
+            } else {
+                self.mini(ui, &mut s, &title);
+            }
             return;
         }
         if self.view == View::Hidden {
@@ -975,10 +1072,11 @@ impl ImguiRenderLoop for Menu {
                 }
                 // Now playing.
                 song_title(ui, &title, song_font, None);
+                let scene = if s.boss { "Boss battle" } else { s.scene.label() };
                 let status = if s.held {
-                    format!("{} - waiting while the game's music plays", s.scene.label())
+                    format!("{scene} - waiting while the game's music plays")
                 } else {
-                    s.scene.label().to_string()
+                    scene.to_string()
                 };
                 ui.text_disabled(status);
                 progress(ui, &mut s);
@@ -1046,7 +1144,10 @@ impl ImguiRenderLoop for Menu {
                 let labels: Vec<String> =
                     std::iter::once("Same as Play from".to_string()).chain(choices.iter().map(|p| p.label())).collect();
                 field("Battle music");
-                if theme::combo(ui, "##battle", &mut battle, &labels) {
+                // The battle list has a Shuffle of its own at the row's end.
+                let shuffle_w = ui.calc_text_size("Shuffle")[0] + ui.frame_height();
+                let combo_w = ui.content_region_avail()[0] - shuffle_w - gap[0];
+                if theme::combo_width(ui, "##battle", &mut battle, &labels, combo_w) {
                     s.config.battle_playlist = (battle > 0).then(|| choices[battle - 1].clone());
                     config_changed = true;
                 }
@@ -1056,6 +1157,20 @@ impl ImguiRenderLoop for Menu {
                          and your exploring song picks up where it left off afterwards.\n\
                          Only while Battles is on.",
                     );
+                }
+                ui.same_line();
+                {
+                    // Without a list of its own, battles follow the main Shuffle.
+                    let _off = ui.begin_disabled(s.config.battle_playlist.is_none());
+                    config_changed |=
+                        theme::toggle(ui, "Shuffle##battle", &mut s.config.battle_shuffle, [shuffle_w, ui.frame_height()]);
+                }
+                if ui.is_item_hovered_with_flags(ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
+                    ui.tooltip_text(if s.config.battle_playlist.is_some() {
+                        "Shuffle the battle music. Separate from the main Shuffle."
+                    } else {
+                        "Pick a battle music list to shuffle it on its own.\nUntil then, battles follow the main Shuffle."
+                    });
                 }
                 let mut vol = s.config.volume * 100.0;
                 field("Volume");

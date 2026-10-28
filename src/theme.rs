@@ -205,12 +205,16 @@ pub fn row_rule(ui: &Ui, min: [f32; 2], max: [f32; 2]) {
 /// A dropdown in the game's style: no arrow box, just a thin cyan chevron at
 /// the right of the field. Fills the rest of the row.
 pub fn combo<S: AsRef<str>>(ui: &Ui, id: &str, current: &mut usize, items: &[S]) -> bool {
+    combo_width(ui, id, current, items, ui.content_region_avail()[0])
+}
+
+/// [`combo`], `w` wide, leaving room on the row for something after it.
+pub fn combo_width<S: AsRef<str>>(ui: &Ui, id: &str, current: &mut usize, items: &[S], w: f32) -> bool {
     let [x, y] = ui.cursor_screen_pos();
-    let w = ui.content_region_avail()[0];
     let h = ui.frame_height();
     let preview = items.get(*current).map_or("", |s| s.as_ref());
     let mut changed = false;
-    ui.set_next_item_width(-1.0);
+    ui.set_next_item_width(w);
     if let Some(_combo) = ui.begin_combo_with_flags(id, preview, ComboBoxFlags::NO_ARROW_BUTTON) {
         // The song rows keep imgui's flat highlight off; a dropdown needs it.
         let _hover = ui.push_style_color(StyleColor::HeaderHovered, [0.45, 0.8, 0.95, 0.35]);

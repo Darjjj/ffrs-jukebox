@@ -10,7 +10,7 @@ use sdk::CriWareRuntime::{FAtomCueInfo, UManaPlayer, USoundAtomCueSheet};
 use sdk::Engine::USubsystemBlueprintLibrary;
 use sdk::UMG::{UEditableText, UEditableTextBox, UMultiLineEditableText, UMultiLineEditableTextBox, UWidget};
 use sdk::mucha::{
-    EeSoundCategory, EeSoundVolumeType, FPLAY_SOUND_PARAMETER, UCPP_BFL_TalkEvent, UCPP_SoundManager,
+    EeSoundCategory, EeSoundVolumeType, FPLAY_SOUND_PARAMETER, UCPP_BFL_Battle, UCPP_BFL_TalkEvent, UCPP_SoundManager,
     UCPP_UI_BattleSubsystem,
 };
 use sdk::rt::{self, FAllocatedString, TSubclassOf, UClassType};
@@ -63,6 +63,14 @@ fn tick() {
 static SOUND_MANAGER: std::sync::atomic::AtomicPtr<UCPP_SoundManager> =
     std::sync::atomic::AtomicPtr::new(null_mut());
 static NEXT_SEARCH: AtomicU64 = AtomicU64::new(0);
+/// When a story event was last seen playing, and how long a gap between two
+/// of its parts still counts as the event: the game reports no event for a
+/// moment between them.
+static EVENT_SEEN: AtomicU64 = AtomicU64::new(0);
+const EVENT_GAP_MS: u64 = 500;
+/// The same for everyday talk, whose parts follow each other with no gap,
+/// so the mini player comes back as soon as it ends.
+const TALK_GAP_MS: u64 = 100;
 
 fn sound_manager() -> *mut UCPP_SoundManager {
     let found = SOUND_MANAGER.load(Ordering::Relaxed);
@@ -183,6 +191,57 @@ fn watch() -> bool {
     })
 }
 
+thread_local! {
+    /// The current event's id and whether it is everyday talk.
+    static LAST_EVENT: std::cell::RefCell<(String, bool)> = const { std::cell::RefCell::new((String::new(), false)) };
+}
+
+/// Event categories that are everyday talk rather than story: townsfolk
+/// ("AtcRestartTalk"), shops, inns and upgrades ("Shop"), boarding the airship
+/// ("Gimmick"), notices on a bulletin board ("SignboardGimmick") and the
+/// summon trainers ("Summon"). Story scenes are filed by chapter
+/// ("Event.Category.C01"); anything not listed here still counts as one.
+const TALK_CATEGORIES: [&str; 5] = [
+    "Event.Category.AtcRestartTalk",
+    "Event.Category.Shop",
+    "Event.Category.Gimmick",
+    "Event.Category.SignboardGimmick",
+    "Event.Category.Summon",
+];
+
+/// When everyday talk was last seen. A bulletin board's list, then a notice,
+/// then the list again follow each other within a tick, so only a short
+/// [`TALK_GAP_MS`] bridges them.
+static TALK_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the player is talking to someone or reading a sign, for hiding
+/// the mini player during it.
+pub fn talking() -> bool {
+    unsafe { GetTickCount64() }.wrapping_sub(TALK_SEEN.load(Ordering::Relaxed)) < TALK_GAP_MS
+}
+
+/// Whether the playing event is everyday talk (an NPC, a shop) rather than a
+/// story scene. Looked up once per event, and logged then with its id, type,
+/// category and description.
+fn event_is_talk() -> bool {
+    let id = UCPP_BFL_TalkEvent::GetCurrentEventId().ToString();
+    if let Some(talk) = LAST_EVENT.with_borrow(|(last, talk)| (*last == id).then_some(*talk)) {
+        return talk;
+    }
+    let data = UCPP_BFL_TalkEvent::GetCurrentEventData();
+    let sequence = UCPP_BFL_TalkEvent::GetCurrentSequenceData();
+    let category = data.Category.TagName.ToString();
+    let talk = TALK_CATEGORIES.contains(&category.as_str());
+    log::info!(
+        "game: event {id} type={:?} category={category} sequence={} talk={talk} desc={}",
+        data.EventType,
+        sequence.Name.ToString(),
+        data.Description,
+    );
+    LAST_EVENT.set((id, talk));
+    talk
+}
+
 /// A handle on the game for one tick. Every method is a no-op until the sound
 /// manager exists.
 pub struct Game {
@@ -216,7 +275,14 @@ impl Game {
         if !self.ready() {
             return Scene::Exploring;
         }
-        let event = UCPP_BFL_TalkEvent::IsPlayingEvent();
+        // Talking to townsfolk or a shop is part of exploring, so the music
+        // carries on through it; only story scenes count as events.
+        let playing = UCPP_BFL_TalkEvent::IsPlayingEvent();
+        let talk = playing && event_is_talk();
+        if talk {
+            TALK_SEEN.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
+        }
+        let event = playing && !talk;
         // The battle UI's own flag. The encounter's battle group id is not
         // usable: it keeps the last encounter's id after the battle ends.
         let world = sdk::config::UWorld::GetWorld();
@@ -231,6 +297,12 @@ impl Game {
         };
         let battle = unsafe { ui.as_ref() }.is_some_and(|ui| ui.bDuringBattle);
         crate::log_change("signals", format!("game: event={event} battle={battle}"));
+        let now = unsafe { GetTickCount64() };
+        // Only story events outside battle; a battle's own dialogue ends with it.
+        if event && !battle {
+            EVENT_SEEN.store(now, Ordering::Relaxed);
+        }
+        let event = event || now.wrapping_sub(EVENT_SEEN.load(Ordering::Relaxed)) < EVENT_GAP_MS;
         // A battle's intro and in-battle dialogue also count as an event;
         // they belong to the battle, so its music is not handed back for them.
         if battle {
@@ -240,6 +312,17 @@ impl Game {
         } else {
             Scene::Exploring
         }
+    }
+
+    /// Whether the current battle is one the game marks as a boss battle.
+    /// Only meaningful while `scene()` says Battle.
+    pub fn boss_battle(&mut self) -> bool {
+        if !self.ready() {
+            return false;
+        }
+        let boss = UCPP_BFL_Battle::IsBossBattle();
+        crate::log_change("boss", format!("game: boss battle={boss}"));
+        boss
     }
 
     fn bgm_sheet_name() -> String {
