@@ -32,6 +32,19 @@ music. An in-game menu in the game's own style, a mini player, hotkeys and contr
 - **Hotkeys and controller combos**, all rebindable.
 - Steps aside on its own for pre-rendered movies that carry their own soundtrack.
 
+## Screenshots
+
+![The jukebox menu and its settings over the Grandport inn](docs/screenshots/01-hero.jpg)
+
+| | |
+|---|---|
+| ![The menu with the General settings](docs/screenshots/02-settings-general.jpg) | ![The menu with the Battles settings](docs/screenshots/03-settings-battles.jpg) |
+| **General:** crossfade, resume and the mini player | **Battles:** boss music, the victory fanfare and the battle popup |
+| ![The menu with the Controls settings](docs/screenshots/04-settings-controls.jpg) | ![The jukebox menu](docs/screenshots/05-menu.jpg) |
+| **Controls:** rebindable keys and controller combos | **The menu:** every game song, your own music and playlists |
+
+![The mini player over the inn](docs/screenshots/06-mini-player.jpg)
+
 ## Requirements
 
 - FINAL FANTASY RESONANCE (Steam, Windows).
