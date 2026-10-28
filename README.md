@@ -3,7 +3,9 @@
 Play any song you like while you explore FINAL FANTASY RESONANCE: every track in the game, or your own
 music. An in-game menu in the game's own style, a mini player, hotkeys and controller combos.
 
-![FF Resonance Jukebox](docs/thumbnail.jpg)
+[![FF Resonance Jukebox: watch the showcase](docs/thumbnail.jpg)](https://youtu.be/XU42YjN3Cfk)
+
+**[Watch the showcase on YouTube](https://youtu.be/XU42YjN3Cfk)**
 
 ## Features
 
