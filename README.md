@@ -94,7 +94,6 @@ active window.
   cutscenes are covered by the "Exploring, Battling, and Cutscenes" mode.
 - Controller combos can't hide those buttons from the game, so whatever LT and the D-pad do in the game
   still happens.
-- If you also use Resonance Boosters, its speed-reset key defaults to F9; move one of the two.
 - Single-player only; nothing is sent anywhere.
 
 ## Troubleshooting
