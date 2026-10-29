@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
 - **Choose where it plays:** switch Exploring, Battles and Cutscenes on or off, in any mix (Battles alone
   works too). Anywhere it doesn't play, the game's own music comes back.
 - **Battle music of your choice.** Pick a separate list for fights; after the battle your exploring song
-  picks up where it left off.
+  picks up where it left off. The song a fight starts with can loop until it ends (a setting).
 - **Victory fanfare.** Winning a battle fades the jukebox out for the game's own fanfare, then picks up
   your exploring song again (a setting, on by default).
 - **Boss battles keep their music.** Boss fights play the game's own music, as the developers intended

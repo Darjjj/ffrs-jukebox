@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.1 - 2026-10-28
+
+- New setting, "Loop the battle song" (Battles tab, off by default): the song picked as a battle starts
+  keeps playing on a loop until the battle ends, instead of moving on to the next one.
+
 ## 1.4.0 - 2026-10-28
 
 - Boss battles keep the game's own music, as the developers intended: a new setting, "Game music in

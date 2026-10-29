@@ -366,8 +366,12 @@ impl Player {
         // never a reason to skip ahead.
         let mut failed = None;
         let mut cut_off = None;
+        let loop_battle = self.in_battle && state::lock().config.loop_battle_song;
         let finished = match &mut self.now {
             Some((i, Playing::Cue { id, duration, paused: false, started, seen, reached, attempt, fades, fading })) => {
+                // A looping theme held for the whole fight just keeps looping
+                // in the game, with no fade or cut at the end of its length.
+                let duration = if loop_battle && *fades { None } else { *duration };
                 let exists = game.exists(*id);
                 let time = game.time(*id);
                 if exists && !*seen {
@@ -504,9 +508,9 @@ impl Player {
         s.boss = boss;
         s.current = self.now.as_ref().map(|(i, _)| *i).or(self.retry.map(|(i, _, _)| i));
         match &self.now {
-            Some((_, Playing::Cue { id, duration, .. })) => {
+            Some((_, Playing::Cue { id, duration, fades, .. })) => {
                 s.position = game.time(*id);
-                s.duration = *duration;
+                s.duration = if loop_battle && *fades { None } else { *duration };
             }
             Some((_, Playing::File { sink, duration, .. })) => {
                 s.position = sink.get_pos().as_secs_f32();
@@ -619,10 +623,12 @@ impl Player {
     fn advance_from(&mut self, game: &mut Game, natural_end: bool, current: Option<usize>) {
         let (list, repeat, shuffle) = {
             let s = state::lock();
-            // A battle list has its own shuffle switch.
+            // A battle list has its own shuffle switch, and can hold the
+            // song it started with for the whole fight.
             let battle_list = self.in_battle && s.config.battle_playlist.is_some();
             let shuffle = if battle_list { s.config.battle_shuffle } else { s.config.shuffle };
-            (s.songs_of(&self.list_now(&s), current), s.config.repeat, shuffle)
+            let repeat = if battle_list && s.config.loop_battle_song { Repeat::One } else { s.config.repeat };
+            (s.songs_of(&self.list_now(&s), current), repeat, shuffle)
         };
         let len = list.len();
         if len == 0 {

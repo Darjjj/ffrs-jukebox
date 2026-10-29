@@ -488,6 +488,13 @@ impl Menu {
                     );
                     changed |= option(
                         ui,
+                        "Loop the battle song",
+                        "Keeps the song picked as a battle starts playing on a
+loop until the battle ends, instead of moving on.",
+                        &mut s.config.loop_battle_song,
+                    );
+                    changed |= option(
+                        ui,
                         "Let the victory fanfare play",
                         "Winning a battle fades the jukebox out for the game's own\nvictory fanfare, then picks up again once it's over.",
                         &mut s.config.victory_fanfare,
