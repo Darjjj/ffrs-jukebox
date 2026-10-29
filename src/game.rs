@@ -242,6 +242,21 @@ fn event_is_talk() -> bool {
     talk
 }
 
+/// The battle UI's own flag. The encounter's battle group id is not usable:
+/// it keeps the last encounter's id after the battle ends.
+fn during_battle() -> bool {
+    let world = sdk::config::UWorld::GetWorld();
+    if world.is_null() {
+        return false;
+    }
+    let ui = USubsystemBlueprintLibrary::GetWorldSubsystem(
+        world.cast(),
+        TSubclassOf::new(UCPP_UI_BattleSubsystem::static_class()),
+    )
+    .cast::<UCPP_UI_BattleSubsystem>();
+    unsafe { ui.as_ref() }.is_some_and(|ui| ui.bDuringBattle)
+}
+
 /// A handle on the game for one tick. Every method is a no-op until the sound
 /// manager exists.
 pub struct Game {
@@ -268,13 +283,18 @@ impl Game {
         // one) can't be muted like the game's music, so the jukebox steps
         // aside for it. Silent movies play the game's music tracks instead,
         // which the jukebox replaces as usual.
-        if watch() {
+        let movie = watch();
+        if !self.ready() {
+            return if movie { Scene::Movie } else { Scene::Exploring };
+        }
+        let battle = during_battle();
+        // A movie inside a battle (a Vision attack) plays over the game's
+        // battle music, so it stays part of the battle and the song carries on.
+        if movie && !battle {
             crate::log_change("signals", "game: movie with its own audio".into());
             return Scene::Movie;
         }
-        if !self.ready() {
-            return Scene::Exploring;
-        }
+        crate::log_change("movie", format!("game: movie in battle={movie}"));
         // Talking to townsfolk or a shop is part of exploring, so the music
         // carries on through it; only story scenes count as events.
         let playing = UCPP_BFL_TalkEvent::IsPlayingEvent();
@@ -283,19 +303,6 @@ impl Game {
             TALK_SEEN.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
         }
         let event = playing && !talk;
-        // The battle UI's own flag. The encounter's battle group id is not
-        // usable: it keeps the last encounter's id after the battle ends.
-        let world = sdk::config::UWorld::GetWorld();
-        let ui = if world.is_null() {
-            null_mut()
-        } else {
-            USubsystemBlueprintLibrary::GetWorldSubsystem(
-                world.cast(),
-                TSubclassOf::new(UCPP_UI_BattleSubsystem::static_class()),
-            )
-            .cast::<UCPP_UI_BattleSubsystem>()
-        };
-        let battle = unsafe { ui.as_ref() }.is_some_and(|ui| ui.bDuringBattle);
         crate::log_change("signals", format!("game: event={event} battle={battle}"));
         let now = unsafe { GetTickCount64() };
         // Only story events outside battle; a battle's own dialogue ends with it.

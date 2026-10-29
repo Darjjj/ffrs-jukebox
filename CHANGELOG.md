@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.2 - 2026-10-28
+
+- Vision attacks no longer interrupt your battle song. Their movie was mistaken for the battle ending, so
+  the game's battle theme came in and the next battle song started afterwards; now the song carries on
+  straight through. Thanks to Obsidianpunchbowl for the catch.
+
 ## 1.4.1 - 2026-10-28
 
 - New setting, "Loop the battle song" (Battles tab, off by default): the song picked as a battle starts

@@ -89,7 +89,8 @@ active window.
 
 - 16 of the game's 212 named songs have no audio in the game's files (some Pixel Remaster and series
   classics). The jukebox checks every song silently once per game version and leaves those out.
-- Pre-rendered movies with their own soundtrack (the opening, for one) pause the jukebox; in-engine
+- Pre-rendered movies with their own soundtrack (the opening, for one) pause the jukebox. Movies inside a
+  battle (Vision attacks) play over the battle music, so your song carries on through them. In-engine
   cutscenes are covered by the "Exploring, Battling, and Cutscenes" mode.
 - Controller combos can't hide those buttons from the game, so whatever LT and the D-pad do in the game
   still happens.
