@@ -24,6 +24,8 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
   (a setting, on by default).
 - **Battle popup.** The now-playing popup shows the current song when a battle starts and ends (a setting,
   on by default).
+- **Music by place.** The field, towns and dungeons can each have a list of their own (with its own
+  Shuffle), keep the game's own music, or follow Play from. Vision shrines can keep the game's music too.
 - **New song on a new map.** Entering a town or another area can move on to the next song (a setting,
   off by default).
 - **Keeps playing while you talk.** Townsfolk, shops, the inn, bulletin boards and save points don't interrupt your
@@ -33,7 +35,8 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
   song where you left it when the game starts.
 - **Mini player** for while you explore, with volume on the mouse wheel. It can hide itself during
   cutscenes and while talking.
-- **Hotkeys and controller combos**, all rebindable.
+- **Hotkeys and controller combos**, all rebindable. Open the menu with the controller to drive it with
+  the D-pad and A/B, and move it with the right stick; the game doesn't see those presses.
 - Steps aside on its own for pre-rendered movies that carry their own soundtrack.
 
 ## Screenshots
@@ -72,11 +75,13 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
 
 | Key | Does |
 |---|---|
-| **F9** | Full menu, then mini player, then hidden |
+| **F9** or **Hold LT + Y** | Full menu, then mini player, then hidden (LT + Y opens it for the controller) |
 | **7 / 8 / 9 / 0** | Previous / play-pause / next / stop |
 | **- / =** | Volume down / up (hold to repeat) |
 | **Hold Left Alt** | Show the cursor over the mini player while exploring |
 | **Hold LT + D-pad** | ◀ previous, ▶ next, ▲ play/pause, ▼ stop |
+| **Hold LT + right stick** | Move the menu or the mini player |
+| **In the menu, by controller** | D-pad or left stick to move, A to choose, B to back out |
 
 Every key can be changed in the menu's ⚙ settings (Controls tab). The General and Battles tabs hold
 crossfade length, resume, the mini player, boss music, the victory fanfare and the battle popup. Hotkeys do nothing while you are typing in a text box, and only work while the game is the
@@ -85,7 +90,8 @@ active window.
 - **Your own songs:** open the My Music tab and press **Open music folder**, add files, then **Rescan folder**.
 - **Right-click any song** to add it to a playlist, rename it or hide it. Hidden songs can be brought back
   from the Hidden tab.
-- **Play from** picks the list Next and Shuffle draw from; **Battle music** picks a separate one for fights.
+- **Play from** picks the list Next and Shuffle draw from; **Music for** picks a separate one for battles,
+  the field, towns or dungeons.
 
 ## Good to know
 
@@ -94,8 +100,8 @@ active window.
 - Pre-rendered movies with their own soundtrack (the opening, for one) pause the jukebox. Movies inside a
   battle (Vision attacks) play over the battle music, so your song carries on through them. In-engine
   cutscenes are covered by the "Exploring, Battling, and Cutscenes" mode.
-- Controller combos can't hide those buttons from the game, so whatever LT and the D-pad do in the game
-  still happens.
+- While the combo's hold button (LT) is down, the game doesn't see the combo buttons or the right stick;
+  LT itself still reaches the game.
 - Single-player only; nothing is sent anywhere.
 
 ## Troubleshooting

@@ -100,6 +100,8 @@ fn main(this_module: HMODULE) {
     log::info!("main: {} files in {}", tracks.len(), music_dir.display());
     state::init(state::Shared { config, config_path, music_dir, tracks, ..Default::default() });
     state::lock().apply_titles();
+    // The controller combos keep their buttons from the game.
+    keys::hook_xinput();
 
     // Game-thread entry for the player: inside UObject::ProcessEvent, not at its
     // entry. The ultrawide fix finds ProcessEvent by its first 0x55 bytes, so a
@@ -127,14 +129,26 @@ fn main(this_module: HMODULE) {
         }
     }
 
-    // Let the game bring up its renderer before hooking it.
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    // Hooking the renderer freezes every thread of the game for a moment
+    // (and builds a throwaway graphics device). Once the game's sound is
+    // running, that froze its audio mid-buffer: an ear-splitting buzz at
+    // start-up. So it's done as soon as the game has a window, well before
+    // the sound starts (about 5 s in).
+    let waited = std::time::Instant::now();
+    while !keys::game_window_exists() && waited.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let waited = waited.elapsed().as_secs_f32();
+    let hooking = std::time::Instant::now();
     match hudhook::Hudhook::builder()
         .with::<hudhook::hooks::dx12::ImguiDx12Hooks>(menu::Menu::new())
         .build()
         .apply()
     {
-        Ok(()) => log::info!("main: overlay hooked (DX12)"),
+        Ok(()) => log::info!(
+            "main: overlay hooked (DX12) {waited:.1}s in, took {} ms",
+            hooking.elapsed().as_millis()
+        ),
         Err(e) => log::error!("main: overlay hook failed: {e:?}"),
     }
 }

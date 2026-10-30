@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::keys::PadButton;
+
 /// Where the jukebox replaces the game's own music. Each place is switched
 /// on or off on its own from the menu.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -132,6 +134,45 @@ impl Playlist {
     }
 }
 
+/// The kind of place the player is exploring, as the game files its maps.
+/// Underground areas and Vision shrines count as dungeons.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Area {
+    Field,
+    Town,
+    Dungeon,
+}
+
+impl Area {
+    pub const ALL: [Area; 3] = [Area::Field, Area::Town, Area::Dungeon];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Area::Field => "Field",
+            Area::Town => "Town",
+            Area::Dungeon => "Dungeon",
+        }
+    }
+}
+
+/// What plays while exploring one kind of place.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum AreaMusic {
+    /// Whatever "Play from" is set to.
+    #[default]
+    PlayFrom,
+    /// A list of its own.
+    List(Playlist),
+    /// The game's own music; the jukebox waits.
+    Game,
+}
+
+impl AreaMusic {
+    pub fn is_play_from(&self) -> bool {
+        *self == AreaMusic::PlayFrom
+    }
+}
+
 /// A playlist you made, separate from Favorites.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct CustomPlaylist {
@@ -179,6 +220,17 @@ pub struct Config {
     /// song from it, and the exploring song picks up where it left off after.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub battle_playlist: Option<Playlist>,
+    /// What plays while exploring the field, towns and dungeons.
+    #[serde(skip_serializing_if = "AreaMusic::is_play_from")]
+    pub field_music: AreaMusic,
+    #[serde(skip_serializing_if = "AreaMusic::is_play_from")]
+    pub town_music: AreaMusic,
+    #[serde(skip_serializing_if = "AreaMusic::is_play_from")]
+    pub dungeon_music: AreaMusic,
+    /// Shuffle for each area's own list, apart from the main Shuffle.
+    pub field_shuffle: bool,
+    pub town_shuffle: bool,
+    pub dungeon_shuffle: bool,
     /// Seconds one song blends into the next; 0 for a hard cut.
     pub crossfade_secs: f32,
     /// Start the last song again, where it was, when the game starts.
@@ -198,13 +250,25 @@ pub struct Config {
     pub resume_after_battle: bool,
     /// Move on to the next song on entering another map (a town, a field).
     pub new_song_on_new_map: bool,
+    /// Leave Vision shrines to the game's own music.
+    pub shrine_game_music: bool,
     /// Tuck the mini player away during cutscenes; it comes back after.
     pub mini_hide_in_cutscenes: bool,
     /// Tuck the mini player away while talking to someone or reading a sign.
     pub mini_hide_while_talking: bool,
+    /// Hide the reminder at the foot of the menu of which keys switch it.
+    pub hide_key_hint: bool,
     /// Hold Left Trigger and press the D-pad: left previous, right next, up
     /// play/pause, down stop.
     pub controller: bool,
+    /// The controller combos: hold `pad_hold`, then press an action button.
+    pub pad_hold: PadButton,
+    pub pad_previous: PadButton,
+    pub pad_next: PadButton,
+    pub pad_play_pause: PadButton,
+    pub pad_stop: PadButton,
+    /// Opens the menu to be driven with the controller, and closes it.
+    pub pad_menu: PadButton,
     /// How long each looping game theme plays before the next song.
     pub loop_minutes: f32,
     /// Your own names for game songs, by cue name, e.g.
@@ -256,6 +320,40 @@ pub struct Config {
     pub mini_pos: Option<[f32; 2]>,
 }
 
+impl Config {
+    pub fn area_music(&self, area: Area) -> &AreaMusic {
+        match area {
+            Area::Field => &self.field_music,
+            Area::Town => &self.town_music,
+            Area::Dungeon => &self.dungeon_music,
+        }
+    }
+
+    pub fn area_shuffle(&self, area: Area) -> bool {
+        match area {
+            Area::Field => self.field_shuffle,
+            Area::Town => self.town_shuffle,
+            Area::Dungeon => self.dungeon_shuffle,
+        }
+    }
+
+    pub fn area_shuffle_mut(&mut self, area: Area) -> &mut bool {
+        match area {
+            Area::Field => &mut self.field_shuffle,
+            Area::Town => &mut self.town_shuffle,
+            Area::Dungeon => &mut self.dungeon_shuffle,
+        }
+    }
+
+    pub fn area_music_mut(&mut self, area: Area) -> &mut AreaMusic {
+        match area {
+            Area::Field => &mut self.field_music,
+            Area::Town => &mut self.town_music,
+            Area::Dungeon => &mut self.dungeon_music,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -276,6 +374,12 @@ impl Default for Config {
             music_folder: "jukebox".into(),
             playlist: Playlist::default(),
             battle_playlist: None,
+            field_music: AreaMusic::PlayFrom,
+            town_music: AreaMusic::PlayFrom,
+            dungeon_music: AreaMusic::PlayFrom,
+            field_shuffle: true,
+            town_shuffle: true,
+            dungeon_shuffle: true,
             crossfade_secs: 2.0,
             resume_on_start: true,
             victory_fanfare: true,
@@ -285,9 +389,17 @@ impl Default for Config {
             loop_battle_song: false,
             resume_after_battle: true,
             new_song_on_new_map: false,
+            shrine_game_music: false,
             mini_hide_in_cutscenes: true,
             mini_hide_while_talking: false,
+            hide_key_hint: false,
             controller: true,
+            pad_hold: PadButton::LT,
+            pad_previous: PadButton::DpadLeft,
+            pad_next: PadButton::DpadRight,
+            pad_play_pause: PadButton::DpadUp,
+            pad_stop: PadButton::DpadDown,
+            pad_menu: PadButton::Y,
             loop_minutes: 3.0,
             titles: BTreeMap::new(),
             file_titles: BTreeMap::new(),
@@ -305,6 +417,84 @@ impl Default for Config {
             menu_size: None,
             settings_size: None,
             mini_pos: None,
+        }
+    }
+}
+
+/// The controller combo buttons, in the order the settings list them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PadBind {
+    Hold,
+    Previous,
+    Next,
+    PlayPause,
+    Stop,
+    Menu,
+}
+
+impl PadBind {
+    pub const ALL: [PadBind; 6] =
+        [PadBind::Hold, PadBind::Previous, PadBind::Next, PadBind::PlayPause, PadBind::Stop, PadBind::Menu];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PadBind::Hold => "Hold",
+            PadBind::Previous => "Previous song",
+            PadBind::Next => "Next song",
+            PadBind::PlayPause => "Play / pause",
+            PadBind::Stop => "Stop",
+            PadBind::Menu => "Open the menu",
+        }
+    }
+}
+
+impl Config {
+    pub fn pad(&self, bind: PadBind) -> PadButton {
+        match bind {
+            PadBind::Hold => self.pad_hold,
+            PadBind::Previous => self.pad_previous,
+            PadBind::Next => self.pad_next,
+            PadBind::PlayPause => self.pad_play_pause,
+            PadBind::Stop => self.pad_stop,
+            PadBind::Menu => self.pad_menu,
+        }
+    }
+
+    fn pad_mut(&mut self, bind: PadBind) -> &mut PadButton {
+        match bind {
+            PadBind::Hold => &mut self.pad_hold,
+            PadBind::Previous => &mut self.pad_previous,
+            PadBind::Next => &mut self.pad_next,
+            PadBind::PlayPause => &mut self.pad_play_pause,
+            PadBind::Stop => &mut self.pad_stop,
+            PadBind::Menu => &mut self.pad_menu,
+        }
+    }
+
+    /// Sets a combo button; one already used by another combo swaps over.
+    pub fn set_pad(&mut self, bind: PadBind, button: PadButton) {
+        let old = self.pad(bind);
+        if let Some(other) = PadBind::ALL.into_iter().find(|&b| b != bind && self.pad(b) == button) {
+            *self.pad_mut(other) = old;
+        }
+        *self.pad_mut(bind) = button;
+    }
+
+    pub fn pad_binds(&self) -> crate::keys::PadBinds {
+        crate::keys::PadBinds {
+            hold: self.pad_hold,
+            previous: self.pad_previous,
+            next: self.pad_next,
+            play_pause: self.pad_play_pause,
+            stop: self.pad_stop,
+            menu: self.pad_menu,
+        }
+    }
+
+    pub fn reset_pad(&mut self) {
+        let d = Config::default();
+        for b in PadBind::ALL {
+            *self.pad_mut(b) = d.pad(b);
         }
     }
 }
@@ -523,6 +713,32 @@ mod tests {
         assert!(toml::from_str::<Config>(&std::fs::read_to_string(&path).unwrap()).is_ok());
         assert!(!path.with_extension("toml.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn area_music_round_trips_and_defaults_to_play_from() {
+        let mut c = Config::default();
+        c.field_music = AreaMusic::List(Playlist::Custom("Overworld".into()));
+        c.town_music = AreaMusic::Game;
+        let text = toml::to_string(&c).unwrap();
+        assert!(!text.contains("dungeon_music"));
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.field_music, c.field_music);
+        assert_eq!(back.town_music, AreaMusic::Game);
+        assert_eq!(back.dungeon_music, AreaMusic::PlayFrom);
+        assert!(back.field_shuffle && back.town_shuffle && back.dungeon_shuffle && !back.shrine_game_music);
+    }
+
+    #[test]
+    fn pad_buttons_swap_instead_of_doubling_up_and_round_trip() {
+        let mut c = Config::default();
+        c.set_pad(PadBind::Hold, PadButton::DpadLeft);
+        assert_eq!((c.pad_hold, c.pad_previous), (PadButton::DpadLeft, PadButton::LT));
+        c.set_pad(PadBind::Menu, PadButton::View);
+        let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!((back.pad_hold, back.pad_previous, back.pad_menu), (PadButton::DpadLeft, PadButton::LT, PadButton::View));
+        let old: Config = toml::from_str("controller = true").unwrap();
+        assert_eq!((old.pad_hold, old.pad_menu), (PadButton::LT, PadButton::Y));
     }
 
     #[test]

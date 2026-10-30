@@ -59,6 +59,8 @@ pub enum Command {
     Rescan,
     /// Check every game song for audio again.
     CheckSongs,
+    /// A list choice changed (Play from, Battle music, an area's music).
+    ListChanged,
 }
 
 #[derive(Default)]
@@ -83,6 +85,10 @@ pub struct Shared {
     /// Talking to someone or reading a sign (not a story scene).
     pub talking: bool,
     pub scene: Scene,
+    /// The kind of place being explored, once the map is known.
+    pub area: Option<crate::config::Area>,
+    /// That place is a Vision shrine (counted as a dungeon).
+    pub shrine: bool,
     pub position: f32,
     pub duration: Option<f32>,
     /// Bumped on every track change, so the menu can pop a now-playing toast.
@@ -198,7 +204,13 @@ impl Shared {
             self.config.playlist = new.clone();
         }
         if self.config.battle_playlist.as_ref() == Some(&old) {
-            self.config.battle_playlist = Some(new);
+            self.config.battle_playlist = Some(new.clone());
+        }
+        for area in crate::config::Area::ALL {
+            let music = self.config.area_music_mut(area);
+            if *music == crate::config::AreaMusic::List(old.clone()) {
+                *music = crate::config::AreaMusic::List(new.clone());
+            }
         }
         self.config.playlists[p].name = name;
         self.save_config();
@@ -214,6 +226,12 @@ impl Shared {
         }
         if self.config.battle_playlist.as_ref() == Some(&removed) {
             self.config.battle_playlist = None;
+        }
+        for area in crate::config::Area::ALL {
+            let music = self.config.area_music_mut(area);
+            if *music == crate::config::AreaMusic::List(removed.clone()) {
+                *music = crate::config::AreaMusic::PlayFrom;
+            }
         }
         self.save_config();
     }

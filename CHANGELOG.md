@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.6.0 - 2026-10-30 - Improved controller support
+
+- Controller combos are rebindable in the Controls tab: the button to hold (LT by default) and each
+  action. The game no longer sees the combo buttons while the hold button is down, so LT + D-pad no
+  longer also does whatever the D-pad does in the game.
+- Hold + Y (rebindable) steps through the views like F9. The full menu opens ready for the controller:
+  D-pad or left stick to move, A to choose, B to back out (it presses Back where the menu shows one).
+  The game doesn't see the controller meanwhile, and the menu remembers where you were for next time.
+  A click or the mouse wheel hands the menu back to the mouse.
+- Hold + right stick moves the menu or the mini player.
+- Music by place: under "Music for", Battles, Field, Towns and Dungeons can each have a list of their
+  own (with its own Shuffle), the game's own music, or follow "Play from". Thanks to NetalyaTaeris for
+  the extra customization suggestion.
+- New setting, "Game music in Vision shrines" (General tab, off by default).
+- Changing the list that's playing now crossfades to a song from it, unless the current song is in it.
+- Leaving a place left to the game's music carries on with the song that was waiting, if it belongs.
+- The status line says which kind of place you're exploring.
+- The key reminder at the foot of the menu is cleaner, includes the controller combo, and can be hidden
+  ("Hide the key reminder", General tab).
+- Fixed an ear-splitting buzz that could happen as the game started: the overlay now hooks in before
+  the game's sound starts.
+- Help text in the settings wraps instead of running off the window.
+
 ## 1.5.0 - 2026-10-29
 
 - New setting, "New song on a new map" (General tab, off by default): entering another map, such as

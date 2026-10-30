@@ -3,13 +3,13 @@
 use std::time::Instant;
 
 use hudhook::imgui::{
-    Condition, Context, FontId, Io, ItemHoveredFlags, MouseButton, ProgressBar, DragDropFlags, Key, SelectableFlags, StyleColor, StyleVar, TabBarFlags, Ui, WindowHoveredFlags,
+    BackendFlags, Condition, ConfigFlags, Context, FontId, Io, ItemHoveredFlags, MouseButton, ProgressBar, DragDropFlags, Key, SelectableFlags, StyleColor, StyleVar, TabBarFlags, Ui, WindowHoveredFlags,
     WindowFlags,
 };
 use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
 
-use crate::config::{Bind, Playlist, Repeat};
-use crate::keys::{self, KeyPoll};
+use crate::config::{Area, AreaMusic, Bind, PadBind, Playlist, Repeat};
+use crate::keys::{self, KeyPoll, PadButton, PadEvent, PadState};
 use crate::state::{self, Command, List};
 use crate::theme::{self, ACCENT, DIM, Icon};
 
@@ -67,8 +67,37 @@ pub struct Menu {
     keys: KeyPoll,
     pad: keys::PadPoll,
     settings_open: bool,
+    /// The place chosen under "Music for": battles, field, towns, dungeons.
+    place_tab: usize,
     /// The keybind waiting for its new key in the settings.
     capturing: Option<Bind>,
+    /// The controller combo button waiting for its new button.
+    pad_capturing: Option<PadBind>,
+    /// The menu is being driven with the controller (opened by its combo).
+    pad_nav: bool,
+    /// Give the menu the focus on its next frame, so the controller starts
+    /// out in it.
+    pad_focus: bool,
+    /// The controller as last read, fed to the menu while navigating, and
+    /// the menu's keys as last fed.
+    pad_now: PadState,
+    pad_fed: [bool; 10],
+    /// B was pressed while navigating: close whatever is on top.
+    pad_back: bool,
+    /// The combo Hold button is down.
+    pad_hold_down: bool,
+    /// The B press that closed the menu (or the settings) is kept from it
+    /// until let go: the menu's own "cancel" would forget the spot the
+    /// controller was on, which it otherwise remembers for next time.
+    pad_swallow_b: bool,
+    /// A Back button was shown this frame (an open playlist's), which B
+    /// presses.
+    back_shown: bool,
+    /// Hold + right stick: how far it leans, moving the menu or the mini
+    /// player; and where each window was last frame.
+    pad_move: [f32; 2],
+    mini_at: Option<[f32; 2]>,
+    full_at: Option<[f32; 2]>,
     search: String,
     /// The playlist or folder open in the Playlists tab; `None` shows the
     /// cards.
@@ -126,6 +155,18 @@ impl Menu {
             pad: keys::PadPoll::new(),
             settings_open: false,
             capturing: None,
+            pad_capturing: None,
+            pad_nav: false,
+            pad_focus: false,
+            pad_now: PadState::default(),
+            pad_fed: [false; 10],
+            pad_back: false,
+            pad_hold_down: false,
+            pad_swallow_b: false,
+            back_shown: false,
+            pad_move: [0.0; 2],
+            mini_at: None,
+            full_at: None,
             search: String::new(),
             open_list: None,
             new_list: None,
@@ -135,6 +176,7 @@ impl Menu {
             toast_serial: 0,
             toast_since: None,
             was_battle: false,
+            place_tab: 1,
             battle_changed: None,
             battle_toast_due: false,
             heading: None,
@@ -177,18 +219,47 @@ impl Menu {
             self.volume_unsaved = false;
             state::lock().save_config();
         }
-        // Controller combos: hold Left Trigger and press the D-pad. Read every
+        // Controller combos: hold one button and press another. Read every
         // frame, so a press only counts once.
-        let combos = self.pad.pressed();
-        if focused && !typing && !combos.is_empty() && state::lock().config.controller {
+        let (now, fresh) = self.pad.read();
+        self.pad_now = now;
+        let (binds, on) = {
+            let s = state::lock();
+            (s.config.pad_binds(), s.config.controller)
+        };
+        self.pad_hold_down = on && now.held(binds.hold);
+        self.pad_move = if self.pad_hold_down && focused { now.right_stick() } else { [0.0; 2] };
+        if self.view != View::Full {
+            self.pad_nav = false;
+        }
+        if let Some(bind) = self.pad_capturing {
+            // A combo button being rebound takes the next press.
+            keys::combos(&now, &[], &binds, false, false);
+            if let Some(&button) = fresh.first() {
+                let mut s = state::lock();
+                s.config.set_pad(bind, button);
+                s.save_config();
+                self.pad_capturing = None;
+            }
+        } else {
+            let navigating = self.pad_nav && focused;
+            let events = keys::combos(&now, &fresh, &binds, on && focused && !typing, navigating);
+            self.pad_back = navigating && fresh.contains(&PadButton::B) && !now.held(binds.hold);
             let mut s = state::lock();
-            for combo in combos {
-                s.push(match combo {
-                    keys::PadAction::Previous => Command::Previous,
-                    keys::PadAction::Next => Command::Next,
-                    keys::PadAction::PlayPause => Command::TogglePause,
-                    keys::PadAction::Stop => Command::Stop,
-                });
+            for event in events {
+                match event {
+                    PadEvent::Previous => s.push(Command::Previous),
+                    PadEvent::Next => s.push(Command::Next),
+                    PadEvent::PlayPause => s.push(Command::TogglePause),
+                    PadEvent::Stop => s.push(Command::Stop),
+                    // Steps through the views like the menu key; the full
+                    // menu opens ready for the controller.
+                    PadEvent::Menu => {
+                        self.view = self.view.next();
+                        self.pad_nav = self.view == View::Full;
+                        self.pad_focus = self.pad_nav;
+                    }
+                }
             }
         }
         if pressed.is_empty() || !focused {
@@ -212,7 +283,11 @@ impl Menu {
         let mut volume = None;
         for vk in pressed {
             match Bind::ALL.into_iter().find(|&b| s.config.key(b) == vk) {
-                Some(Bind::Menu) => self.view = self.view.next(),
+                Some(Bind::Menu) => {
+                    // The menu key always opens the menu for the mouse.
+                    self.view = self.view.next();
+                    self.pad_nav = false;
+                }
                 Some(Bind::Previous) => s.push(Command::Previous),
                 Some(Bind::PlayPause) => s.push(Command::TogglePause),
                 Some(Bind::Next) => s.push(Command::Next),
@@ -354,6 +429,7 @@ impl Menu {
             }
             _ => return,
         };
+        self.back_shown = true;
         if ui.small_button("\u{2190} Playlists") {
             self.open_list = None;
         }
@@ -470,6 +546,13 @@ impl Menu {
                         "Moves on to the next song when you enter another map,\nsuch as from the field into a town.",
                         &mut s.config.new_song_on_new_map,
                     );
+                    changed |= option(
+                        ui,
+                        "Game music in Vision shrines",
+                        "Vision shrines keep the game's own music; the jukebox
+waits, and carries on once you leave.",
+                        &mut s.config.shrine_game_music,
+                    );
                     section(ui, "Mini player");
                     changed |= option(
                         ui,
@@ -482,6 +565,13 @@ impl Menu {
                         "Hide while talking",
                         "Tucks the mini player away while you talk to townsfolk,\nshops or read a sign, and brings it back after.",
                         &mut s.config.mini_hide_while_talking,
+                    );
+                    section(ui, "Menu");
+                    changed |= option(
+                        ui,
+                        "Hide the key reminder",
+                        "The line at the foot of the menu saying which keys\nswitch to the mini player.",
+                        &mut s.config.hide_key_hint,
                     );
                 }
                 if let Some(_tab) = tab("Battles") {
@@ -539,23 +629,73 @@ was when the battle started. Off: the next song plays instead.",
                             self.capturing = if waiting { None } else { Some(bind) };
                         }
                     }
-                    ui.text_disabled("Click a key, then press the new one.\nEsc cancels, Delete unbinds.");
+                    note(ui, "Click a key, then press the new one. Esc cancels, Delete unbinds.");
                     if ui.button("Reset keys to defaults") {
                         reset = true;
                     }
                     section(ui, "Controller");
                     changed |= option(
                         ui,
-                        "Hold LT + D-pad",
-                        "Hold Left Trigger and press the D-pad:\n\
-                         Left previous, Right next, Up play/pause, Down stop.\n\
-                         The game still sees those buttons too.",
+                        "Controller combos",
+                        "Hold the Hold button and press another to use the jukebox.\n\
+                         The game doesn't see those presses while Hold is down.",
                         &mut s.config.controller,
                     );
+                    const MOVE_LABEL: &str = "Move the menu";
+                    let label_w = PadBind::ALL
+                        .iter()
+                        .map(|b| ui.calc_text_size(b.label())[0])
+                        .fold(ui.calc_text_size(MOVE_LABEL)[0], f32::max)
+                        + ui.frame_height();
+                    let left = ui.cursor_pos()[0];
+                    let button_w = ui.window_content_region_max()[0] - left - label_w;
+                    {
+                        let _off = ui.begin_disabled(!s.config.controller);
+                        for bind in PadBind::ALL {
+                            ui.align_text_to_frame_padding();
+                            ui.text(bind.label());
+                            ui.same_line_with_pos(left + label_w);
+                            let waiting = self.pad_capturing == Some(bind);
+                            let shown = s.config.pad(bind).label();
+                            let text = match (waiting, bind) {
+                                (true, _) => "Press a button...".to_string(),
+                                (false, PadBind::Hold) => shown.to_string(),
+                                (false, _) => format!("{} + {shown}", s.config.pad_hold.label()),
+                            };
+                            let _lit = waiting.then(|| ui.push_style_color(StyleColor::Button, [0.35, 0.68, 0.84, 0.75]));
+                            if ui.button_with_size(format!("{text}##pad{bind:?}"), [button_w, 0.0]) {
+                                self.pad_capturing = if waiting { None } else { Some(bind) };
+                            }
+                        }
+                        // Moving the menu always uses the right stick; shown
+                        // with the others, but it can't be changed.
+                        ui.align_text_to_frame_padding();
+                        ui.text(MOVE_LABEL);
+                        ui.same_line_with_pos(left + label_w);
+                        ui.button_with_size(
+                            format!("{} + Right stick##padmove", s.config.pad_hold.label()),
+                            [button_w, 0.0],
+                        );
+                        if ui.is_item_hovered() {
+                            ui.tooltip_text("Always the right stick; only Hold can be changed.");
+                        }
+                    }
+                    note(
+                        ui,
+                        "Click a combo, then press its new button on the controller. Open the menu with the \
+                         controller to move around it with the D-pad or left stick: A chooses, B backs out. \
+                         Hold and push the right stick to move the menu or the mini player.",
+                    );
+                    if ui.button("Reset controller to defaults") {
+                        s.config.reset_pad();
+                        self.pad_capturing = None;
+                        changed = true;
+                    }
                 }
                 // A key waiting to be rebound stops waiting once its tab is left.
                 if !on_controls {
                     self.capturing = None;
+                    self.pad_capturing = None;
                 }
             });
         if let Some(z) = resized_to {
@@ -592,8 +732,13 @@ was when the battle started. Off: the next song plays instead.",
         let k = self.scale;
         let _pad = ui.push_style_var(StyleVar::WindowPadding([9.0 * k, 7.0 * k]));
         let _gap = ui.push_style_var(StyleVar::ItemSpacing([5.0 * k, 4.0 * k]));
+        let moving = self.pad_move != [0.0; 2];
+        let (pos, cond) = match (moving, self.mini_at) {
+            (true, Some(at)) => (stick_moved(ui, at, self.pad_move, [w, 60.0]), Condition::Always),
+            _ => (pos, Condition::FirstUseEver),
+        };
         ui.window("##jukebox_mini")
-            .position(pos, Condition::FirstUseEver)
+            .position(pos, cond)
             .size_constraints([w, 0.0], [w, 10_000.0])
             .flags(
                 WindowFlags::NO_TITLE_BAR
@@ -657,7 +802,9 @@ was when the battle started. Off: the next song plays instead.",
                     }
                 });
                 hovered = ui.is_window_hovered_with_flags(WindowHoveredFlags::ROOT_AND_CHILD_WINDOWS);
-                if !ui.is_mouse_down(MouseButton::Left) {
+                self.mini_at = Some(ui.window_pos());
+                // Saved once a drag or a stick move is let go.
+                if !ui.is_mouse_down(MouseButton::Left) && !moving {
                     let p = ui.window_pos();
                     if s.config.mini_pos.is_none_or(|a| (a[0] - p[0]).abs() > 0.5 || (a[1] - p[1]).abs() > 0.5) {
                         moved_to = Some(p);
@@ -916,6 +1063,33 @@ fn header_buttons_ex(ui: &Ui, buttons: &[(Icon, &str)]) -> (Option<usize>, Optio
     (clicked, over)
 }
 
+/// Where a window at `at` goes this frame with the right stick leaning
+/// `lean`: up to 1200 px a second at a full lean, kept on screen with at
+/// least `keep` of it showing.
+fn stick_moved(ui: &Ui, at: [f32; 2], lean: [f32; 2], keep: [f32; 2]) -> [f32; 2] {
+    const SPEED: f32 = 1200.0;
+    let io = ui.io();
+    let step = SPEED * io.delta_time;
+    let [dw, dh] = io.display_size;
+    [
+        (at[0] + lean[0] * step).clamp(0.0, (dw - keep[0]).max(0.0)),
+        (at[1] + lean[1] * step).clamp(0.0, (dh - keep[1]).max(0.0)),
+    ]
+}
+
+/// A dim note that wraps at the window's edge instead of running off it.
+fn note(ui: &Ui, text: &str) {
+    let _wrap = ui.push_text_wrap_pos();
+    ui.text_disabled(text);
+}
+
+/// Whether any popup (a dropdown's list, a right-click menu) is open.
+fn any_popup_open() -> bool {
+    use hudhook::imgui::sys;
+    let flags = (sys::ImGuiPopupFlags_AnyPopupId | sys::ImGuiPopupFlags_AnyPopupLevel) as i32;
+    unsafe { sys::igIsPopupOpen(c"".as_ptr(), flags) }
+}
+
 impl ImguiRenderLoop for Menu {
     fn initialize<'a>(&'a mut self, ctx: &mut Context, _: &'a mut dyn RenderContext) {
         ctx.set_ini_filename(None);
@@ -931,9 +1105,53 @@ impl ImguiRenderLoop for Menu {
         // The mini player stays up while exploring, where the game hides its
         // cursor, so one is drawn only while the mouse is over the player or
         // the show-cursor key (Left Alt) is held.
-        ctx.io_mut().mouse_draw_cursor =
-            self.view == View::Full
-                || (self.view == View::Mini && !self.mini_away && (self.mini_hovered || self.cursor_held));
+        let io = ctx.io_mut();
+        // Whichever was used last drives the menu: a click or the wheel hands
+        // it back to the mouse (and the controller back to the game). Not
+        // mouse movement: the game moves the cursor itself while exploring.
+        let mouse_used = io.mouse_down.iter().any(|&d| d) || io.mouse_wheel != 0.0;
+        if self.view != View::Full || mouse_used {
+            self.pad_nav = false;
+        }
+        io.mouse_draw_cursor = (self.view == View::Full && !self.pad_nav)
+            || (self.view == View::Mini && !self.mini_away && (self.mini_hovered || self.cursor_held));
+        // While the menu is driven with the controller, its buttons move
+        // around the menu: D-pad or left stick to move, A to choose, B to
+        // back out, LB/RB between windows.
+        let nav = self.pad_nav;
+        // A combo (Hold + a button) is for the jukebox, not the menu.
+        let combo = self.pad_hold_down;
+        if nav {
+            io.config_flags |= ConfigFlags::NAV_ENABLE_GAMEPAD;
+            io.backend_flags |= BackendFlags::HAS_GAMEPAD;
+        } else {
+            io.config_flags &= !ConfigFlags::NAV_ENABLE_GAMEPAD;
+            io.backend_flags &= !BackendFlags::HAS_GAMEPAD;
+        }
+        if !self.pad_now.held(PadButton::B) {
+            self.pad_swallow_b = false;
+        }
+        let p = &self.pad_now;
+        let [up, down, left, right] = p.nav();
+        let keys = [
+            (Key::GamepadDpadUp, up),
+            (Key::GamepadDpadDown, down),
+            (Key::GamepadDpadLeft, left),
+            (Key::GamepadDpadRight, right),
+            (Key::GamepadFaceDown, p.held(PadButton::A)),
+            (Key::GamepadFaceRight, p.held(PadButton::B) && !self.pad_swallow_b),
+            (Key::GamepadFaceLeft, p.held(PadButton::X)),
+            (Key::GamepadFaceUp, p.held(PadButton::Y)),
+            (Key::GamepadL1, p.held(PadButton::LB)),
+            (Key::GamepadR1, p.held(PadButton::RB)),
+        ];
+        for (i, (key, down)) in keys.into_iter().enumerate() {
+            let down = nav && !combo && down;
+            if self.pad_fed[i] != down {
+                io.add_key_event(key, down);
+                self.pad_fed[i] = down;
+            }
+        }
     }
 
     fn render(&mut self, ui: &mut Ui) {
@@ -1054,14 +1272,32 @@ impl ImguiRenderLoop for Menu {
         let renaming = std::cell::RefCell::new(self.renaming.take());
         // The title bar is drawn by hand below, in the FF style; the window
         // is dragged from any empty spot instead.
-        let mut window = ui
-            .window("Jukebox")
-            .size(size, Condition::FirstUseEver)
-            .flags(WindowFlags::NO_TITLE_BAR | WindowFlags::NO_COLLAPSE);
+        // Opened with the controller, the menu takes the focus back on the
+        // spot the controller was on last time. Focusing it as it appears
+        // would start over at the first item (the menu library does that
+        // for windows that appear focused), so it appears unfocused and is
+        // focused from inside instead.
+        let pad_focus = std::mem::take(&mut self.pad_focus);
+        let mut flags = WindowFlags::NO_TITLE_BAR | WindowFlags::NO_COLLAPSE;
+        if pad_focus {
+            flags |= WindowFlags::NO_FOCUS_ON_APPEARING;
+        }
+        let mut window = ui.window("Jukebox").size(size, Condition::FirstUseEver).flags(flags);
         if let Some(pos) = pos {
             window = window.position(pos, Condition::FirstUseEver);
         }
+        let moving = self.pad_move != [0.0; 2];
+        if let (true, Some(at)) = (moving, self.full_at) {
+            window = window.position(stick_moved(ui, at, self.pad_move, [100.0, 60.0]), Condition::Always);
+        }
+        let full_at = std::cell::Cell::new(None);
+        // The controller is inside one of the menu's lists (a child window)
+        // rather than on the menu itself; B steps back out of it.
+        let in_list = std::cell::Cell::new(false);
         window.build(|| {
+                if pad_focus {
+                    unsafe { hudhook::imgui::sys::igSetWindowFocus_Nil() };
+                }
                 theme::backdrop(ui);
                 // Header: title on the left, mini-player and hide buttons on
                 // the right.
@@ -1077,9 +1313,15 @@ impl ImguiRenderLoop for Menu {
                     None => {}
                 }
                 main_rect = Some((ui.window_pos(), ui.window_size()));
+                full_at.set(Some(ui.window_pos()));
+                in_list.set(
+                    !ui.is_window_focused()
+                        && ui.is_window_focused_with_flags(hudhook::imgui::WindowFocusedFlags::CHILD_WINDOWS),
+                );
                 theme::heading_rule(ui);
-                // Saved once a drag or resize is let go, not every frame of it.
-                if !ui.is_mouse_down(MouseButton::Left) {
+                // Saved once a drag, resize or stick move is let go, not
+                // every frame of it.
+                if !ui.is_mouse_down(MouseButton::Left) && !moving {
                     let (p, z) = (ui.window_pos(), ui.window_size());
                     let moved = |a: Option<[f32; 2]>, b: [f32; 2]| {
                         a.is_none_or(|a| (a[0] - b[0]).abs() > 0.5 || (a[1] - b[1]).abs() > 0.5)
@@ -1092,7 +1334,14 @@ impl ImguiRenderLoop for Menu {
                 }
                 // Now playing.
                 song_title(ui, &title, song_font, None);
-                let scene = if s.boss { "Boss battle" } else { s.scene.label() };
+                let scene = match (s.boss, s.scene, s.area) {
+                    (true, ..) => "Boss battle",
+                    (_, crate::config::Scene::Exploring, Some(Area::Field)) => "Exploring the field",
+                    (_, crate::config::Scene::Exploring, Some(Area::Town)) => "Exploring a town",
+                    (_, crate::config::Scene::Exploring, Some(Area::Dungeon)) if s.shrine => "Exploring a Vision shrine",
+                    (_, crate::config::Scene::Exploring, Some(Area::Dungeon)) => "Exploring a dungeon",
+                    _ => s.scene.label(),
+                };
                 let status = if s.held {
                     format!("{scene} - waiting while the game's music plays")
                 } else {
@@ -1112,7 +1361,7 @@ impl ImguiRenderLoop for Menu {
                 let _tight = ui.push_style_var(StyleVar::ItemSpacing([gap[0], gap[1] * 0.5]));
                 // Settings read left to right like the game's own menus: the
                 // label, then its control filling the rest of the row.
-                let label_w = ui.calc_text_size("Battle music")[0] + ui.frame_height() * 1.2;
+                let label_w = ui.calc_text_size("Play during")[0] + ui.frame_height() * 1.2;
                 let field = |text: &str| {
                     ui.align_text_to_frame_padding();
                     ui.text_disabled(text);
@@ -1149,47 +1398,94 @@ impl ImguiRenderLoop for Menu {
                 field("Play from");
                 if theme::combo(ui, "##from", &mut chosen, &labels) {
                     s.config.playlist = choices[chosen].clone();
+                    s.push(Command::ListChanged);
                     config_changed = true;
                 }
                 if ui.is_item_hovered() {
                     ui.tooltip_text("Which songs Next and Shuffle choose from.\nFolders inside your music folder are listed too.");
                 }
-                // Battle music: "Same as Play from" first, then the same lists.
-                let mut battle = s
-                    .config
-                    .battle_playlist
-                    .as_ref()
-                    .and_then(|b| choices.iter().position(|p| p == b))
-                    .map_or(0, |p| p + 1);
-                let labels: Vec<String> =
-                    std::iter::once("Same as Play from".to_string()).chain(choices.iter().map(|p| p.label())).collect();
-                field("Battle music");
-                // The battle list has a Shuffle of its own at the row's end.
+                // Music by place: one row of place tabs, then the list and
+                // Shuffle for the chosen one. Every place offers "Same as Play
+                // from" and the lists; the areas also the game's own music.
                 let shuffle_w = ui.calc_text_size("Shuffle")[0] + ui.frame_height();
+                field("Music for");
+                let places = ["Battles", "Field", "Towns", "Dungeons"];
+                let tab_w = (ui.content_region_avail()[0] - gap[0] * 3.0) / 4.0;
+                for (n, label) in places.iter().enumerate() {
+                    if n > 0 {
+                        ui.same_line();
+                    }
+                    let mut on = self.place_tab == n;
+                    if theme::toggle(ui, &format!("{label}##place"), &mut on, [tab_w, ui.frame_height()]) {
+                        self.place_tab = n;
+                    }
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(match n {
+                            0 => "Music for battles. A battle starts a song from it, and your\n\
+                                  exploring song picks up where it left off afterwards.\n\
+                                  Game's own music is the same as Battles off under Play during.",
+                            1 => "Music while exploring the open field.",
+                            2 => "Music while exploring towns.",
+                            _ => "Music while exploring dungeons, caves and shrines.",
+                        });
+                    }
+                }
+                let area = [None, Some(Area::Field), Some(Area::Town), Some(Area::Dungeon)][self.place_tab.min(3)];
+                // For battles, the game's own music is the Battles switch
+                // under Play during: picking one sets the other.
+                let mut labels = vec!["Same as Play from".to_string(), "Game's own music".to_string()];
+                let lists_from = labels.len();
+                labels.extend(choices.iter().map(|p| p.label()));
+                let mut chosen = match area {
+                    None if !s.config.play_in().battles => 1,
+                    None => s.config.battle_playlist.as_ref().and_then(|b| choices.iter().position(|p| p == b)).map_or(0, |i| i + lists_from),
+                    Some(a) => match s.config.area_music(a) {
+                        AreaMusic::PlayFrom => 0,
+                        AreaMusic::Game => 1,
+                        AreaMusic::List(p) => choices.iter().position(|c| c == p).map_or(0, |i| i + lists_from),
+                    },
+                };
+                field("");
                 let combo_w = ui.content_region_avail()[0] - shuffle_w - gap[0];
-                if theme::combo_width(ui, "##battle", &mut battle, &labels, combo_w) {
-                    s.config.battle_playlist = (battle > 0).then(|| choices[battle - 1].clone());
+                if theme::combo_width(ui, "##placemusic", &mut chosen, &labels, combo_w) {
+                    let list = (chosen >= lists_from).then(|| choices[chosen - lists_from].clone());
+                    match area {
+                        None => {
+                            let mut play = s.config.play_in();
+                            play.battles = chosen != 1;
+                            s.config.play_in = Some(play);
+                            if chosen != 1 {
+                                s.config.battle_playlist = list;
+                            }
+                        }
+                        Some(a) => {
+                            *s.config.area_music_mut(a) = match (chosen, list) {
+                                (_, Some(p)) => AreaMusic::List(p),
+                                (1, None) => AreaMusic::Game,
+                                _ => AreaMusic::PlayFrom,
+                            }
+                        }
+                    }
+                    s.push(Command::ListChanged);
                     config_changed = true;
                 }
-                if ui.is_item_hovered() {
-                    ui.tooltip_text(
-                        "A list of its own for battles. A battle starts a song from it,\n\
-                         and your exploring song picks up where it left off afterwards.\n\
-                         Only while Battles is on.",
-                    );
-                }
                 ui.same_line();
+                // A place with a list of its own shuffles on its own.
+                let own_list = chosen >= lists_from;
                 {
-                    // Without a list of its own, battles follow the main Shuffle.
-                    let _off = ui.begin_disabled(s.config.battle_playlist.is_none());
-                    config_changed |=
-                        theme::toggle(ui, "Shuffle##battle", &mut s.config.battle_shuffle, [shuffle_w, ui.frame_height()]);
+                    let _off = ui.begin_disabled(!own_list);
+                    let shuffle = match area {
+                        None => &mut s.config.battle_shuffle,
+                        Some(a) => s.config.area_shuffle_mut(a),
+                    };
+                    config_changed |= theme::toggle(ui, "Shuffle##place", shuffle, [shuffle_w, ui.frame_height()]);
                 }
                 if ui.is_item_hovered_with_flags(ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
-                    ui.tooltip_text(if s.config.battle_playlist.is_some() {
-                        "Shuffle the battle music. Separate from the main Shuffle."
+                    ui.tooltip_text(if own_list {
+                        "Shuffle this list. Separate from the main Shuffle."
                     } else {
-                        "Pick a battle music list to shuffle it on its own.\nUntil then, battles follow the main Shuffle."
+                        "Pick a list here to shuffle it on its own.
+Until then, it follows the main Shuffle."
                     });
                 }
                 let mut vol = s.config.volume * 100.0;
@@ -1540,10 +1836,50 @@ impl ImguiRenderLoop for Menu {
                         }
                     }
                 }
-                ui.text_disabled(format!("{}: mini player, then hide", keys::name(key)));
+                // Which keys step on from here, centred at the foot.
+                if !s.config.hide_key_hint {
+                    let mut hint = keys::name(key);
+                    if s.config.controller {
+                        hint = format!("{hint}  or  {} + {}", s.config.pad_hold.label(), s.config.pad_menu.label());
+                    }
+                    let hint = format!("{hint}  \u{00B7}  mini player");
+                    let _font = small_font.map(|f| ui.push_font(f));
+                    let w = ui.calc_text_size(&hint)[0];
+                    let avail = ui.content_region_avail()[0];
+                    if w < avail {
+                        ui.set_cursor_pos([ui.cursor_pos()[0] + (avail - w) / 2.0, ui.cursor_pos()[1]]);
+                    }
+                    ui.text_disabled(hint);
+                }
             });
         if let Some(v) = next_view {
             self.view = v;
+        }
+        if let Some(at) = full_at.get() {
+            self.full_at = Some(at);
+        }
+        // B closes a popup first (the menu does that itself), then the
+        // settings; then it's the Back button where one shows; then it backs
+        // out of a list (the menu again), and last steps on to the mini
+        // player like the menu key.
+        let back = std::mem::take(&mut self.pad_back) && !any_popup_open() && !ui.is_any_item_active();
+        let back_shown = std::mem::take(&mut self.back_shown);
+        if back && self.settings_open {
+            self.settings_open = false;
+            self.capturing = None;
+            self.pad_capturing = None;
+            self.pad_swallow_b = true;
+        } else if back && back_shown {
+            // Where the menu shows a Back button, B presses it, even from
+            // inside the list under it.
+            self.open_list = None;
+            self.pad_swallow_b = true;
+        } else if back && !in_list.get() {
+            if self.pad_nav {
+                self.pad_nav = false;
+                self.view = self.view.next();
+                self.pad_swallow_b = true;
+            }
         }
         self.hovered = hovered_now.get();
         self.renaming = renaming.into_inner();

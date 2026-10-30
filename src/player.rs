@@ -11,7 +11,7 @@ use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source as _};
 
 use crate::check::SongCheck;
 use crate::loudness;
-use crate::config::{Playlist, Repeat};
+use crate::config::{Area, AreaMusic, Playlist, Repeat};
 use crate::game::{BgmMute, Game, refresh_game_tracks};
 use crate::state::{self, Command, Source};
 
@@ -118,6 +118,12 @@ pub struct Player {
     /// since and when it was first seen.
     map_id: i32,
     map_new: Option<(i32, Instant)>,
+    /// The kind of place that map is (field, town, dungeon).
+    area: Option<Area>,
+    shrine: bool,
+    /// The list songs came from as of the last tick, to tell whether a
+    /// changed list choice is the one playing.
+    last_list: Playlist,
     /// The next start is a change of song, so it crossfades.
     crossfade_next: bool,
     /// When the current song started fading in, and over how long.
@@ -135,6 +141,15 @@ pub struct Player {
     duck_at: Instant,
     /// This battle's fanfare has played; cleared once the battle is over.
     after_fanfare: bool,
+}
+
+/// What plays while exploring a place of this kind; a Vision shrine can be
+/// left to the game's own music whatever the dungeon setting.
+fn area_source(s: &state::Shared, area: Option<Area>, shrine: bool) -> AreaMusic {
+    if shrine && s.config.shrine_game_music {
+        return AreaMusic::Game;
+    }
+    area.map_or(AreaMusic::PlayFrom, |a| s.config.area_music(a).clone())
 }
 
 /// How long a new map has to hold before it counts as entered.
@@ -161,6 +176,9 @@ impl Player {
             fight_resume: None,
             map_id: 0,
             map_new: None,
+            area: None,
+            shrine: false,
+            last_list: Playlist::AllSongs,
             battle_resume: None,
             crossfade_next: false,
             fade_in: None,
@@ -174,12 +192,21 @@ impl Player {
     }
 
     /// The list Next and Shuffle draw from right now: the battle music
-    /// during a battle that has one, otherwise "Play from".
+    /// during a battle that has one, else this kind of place's own list,
+    /// else "Play from".
     fn list_now(&self, s: &state::Shared) -> Playlist {
         match (&s.config.battle_playlist, self.in_battle) {
             (Some(b), true) => b.clone(),
-            _ => s.config.playlist.clone(),
+            _ => match self.area.map(|a| s.config.area_music(a)) {
+                Some(AreaMusic::List(p)) => p.clone(),
+                _ => s.config.playlist.clone(),
+            },
         }
+    }
+
+    /// This kind of place is left to the game's own music.
+    fn area_is_game(&self, s: &state::Shared) -> bool {
+        area_source(s, self.area, self.shrine) == AreaMusic::Game
     }
 
     /// The current song and how far into it, if any.
@@ -271,26 +298,48 @@ impl Player {
         // A map change passes through loading maps for a moment; only one
         // that holds counts, and by then the game has finished loading it.
         match self.map_new {
-            Some((new, since)) if new == id => {
-                if since.elapsed() < MAP_SETTLE {
-                    return;
-                }
-            }
+            Some((new, since)) if new == id && since.elapsed() >= MAP_SETTLE => {}
+            Some((new, _)) if new == id => return,
             _ => {
                 self.map_new = Some((id, Instant::now()));
-                if self.map_id > 0 {
-                    return;
-                }
+                return;
             }
         }
+        // A loading map has no map data of its own; wait for a real one.
+        let Some((area, shrine)) = game.map_area(id) else {
+            self.map_new = Some((id, Instant::now()));
+            return;
+        };
         self.map_new = None;
         let old = std::mem::replace(&mut self.map_id, id);
         log::info!("player: map {old} -> {id}");
-        let (on, playing) = {
-            let s = state::lock();
-            (s.config.new_song_on_new_map, s.playing)
+        let old_area = std::mem::replace(&mut self.area, Some(area));
+        let old_shrine = std::mem::replace(&mut self.shrine, shrine);
+        let (on, playing, before, now) = {
+            let mut s = state::lock();
+            s.area = self.area;
+            s.shrine = shrine;
+            let (before, now) = (area_source(&s, old_area, old_shrine), area_source(&s, self.area, shrine));
+            (s.config.new_song_on_new_map, s.playing, before, now)
         };
-        if old > 0 && on && playing && play_in.covers(scene) && self.now.is_some() {
+        if old <= 0 || !playing || !play_in.covers(scene) || now == AreaMusic::Game {
+            return;
+        }
+        let current = self.now.as_ref().map(|(i, _)| *i);
+        // Back out of a place left to the game's music: the song that was
+        // waiting carries on, if it belongs here.
+        let belongs = current.is_some_and(|c| {
+            let s = state::lock();
+            s.songs_of(&self.list_now(&s), current).contains(&c)
+        });
+        if before == AreaMusic::Game && belongs {
+            log::info!("player: back from the game's music, the song carries on");
+        } else if before != now {
+            // Into a place with music of its own (or back out of one).
+            log::info!("player: {} music", self.area.map_or("area", |a| a.label()));
+            self.crossfade_next = true;
+            self.advance_from(game, false, current);
+        } else if on && self.now.is_some() {
             log::info!("player: new map, next song");
             self.crossfade_next = true;
             self.advance(game, false);
@@ -570,7 +619,9 @@ impl Player {
         self.after_fanfare = in_battle_scene && (self.after_fanfare || fanfare);
         fanfare |= self.after_fanfare;
         crate::log_change("fanfare", format!("player: victory fanfare playing={fanfare}"));
-        let covered = play_in.covers(scene) && !fanfare && !boss_held;
+        // A kind of place left to the game's own music while exploring.
+        let area_game = scene == crate::config::Scene::Exploring && self.area_is_game(&state::lock());
+        let covered = play_in.covers(scene) && !fanfare && !boss_held && !area_game;
         // The song fades out under the fanfare rather than stopping dead,
         // and fades back in after it.
         let step = self.duck_at.elapsed().as_secs_f32() / FANFARE_FADE;
@@ -611,6 +662,7 @@ impl Player {
             _ => {}
         }
 
+        self.last_list = self.list_now(&state::lock());
         self.save_for_resume(game);
         let mut s = state::lock();
         s.held = playing && !covered;
@@ -695,6 +747,23 @@ impl Player {
                 }
                 None => {}
             },
+            Command::ListChanged => {
+                // Only the list playing right now swaps the song, and only
+                // when the song isn't in the new list too.
+                let (list, songs, playing) = {
+                    let s = state::lock();
+                    let list = self.list_now(&s);
+                    let current = self.now.as_ref().map(|(i, _)| *i);
+                    (list.clone(), s.songs_of(&list, current), s.playing)
+                };
+                let current = self.now.as_ref().map(|(i, _)| *i);
+                if list != self.last_list && playing && current.is_some_and(|c| !songs.contains(&c)) {
+                    log::info!("player: now playing from {}", list.label());
+                    self.crossfade_next = true;
+                    self.advance_from(game, false, current);
+                }
+                self.last_list = list;
+            }
             Command::Rescan => {
                 if matches!(self.now, Some((_, Playing::File { .. }))) {
                     self.stop(game);
@@ -733,9 +802,15 @@ impl Player {
         let (list, repeat, shuffle) = {
             let s = state::lock();
             // A battle list has its own shuffle switch, and can hold the
-            // song it started with for the whole fight.
+            // song it started with for the whole fight; an area's own list
+            // has its own shuffle switch too.
             let battle_list = self.in_battle && s.config.battle_playlist.is_some();
-            let shuffle = if battle_list { s.config.battle_shuffle } else { s.config.shuffle };
+            let area_list = self.area.filter(|&a| !self.in_battle && matches!(s.config.area_music(a), AreaMusic::List(_)));
+            let shuffle = match (battle_list, area_list) {
+                (true, _) => s.config.battle_shuffle,
+                (false, Some(a)) => s.config.area_shuffle(a),
+                (false, None) => s.config.shuffle,
+            };
             let repeat = if battle_list && s.config.loop_battle_song { Repeat::One } else { s.config.repeat };
             (s.songs_of(&self.list_now(&s), current), repeat, shuffle)
         };

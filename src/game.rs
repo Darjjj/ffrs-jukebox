@@ -342,6 +342,37 @@ impl Game {
         UCPP_BFL_Map::GetCurrentMapId()
     }
 
+    /// The kind of place the current map is, logged with its name. Only
+    /// read as a map is entered: the game hands back a copy of the map's
+    /// whole table row, whose few small allocations are left to the game.
+    /// Also says whether it's a Vision shrine.
+    pub fn map_area(&mut self, id: i32) -> Option<(crate::config::Area, bool)> {
+        use crate::config::Area;
+        use sdk::mucha::EeMapType;
+        if !self.ready() {
+            return None;
+        }
+        let data = std::mem::ManuallyDrop::new(UCPP_BFL_Map::GetCurrntMapData());
+        if data.ID != id {
+            log::debug!("game: map {id} reads back as {} (still loading)", data.ID);
+            return None;
+        }
+        let area = if data.MapType == EeMapType::Town {
+            Area::Town
+        } else if data.MapType == EeMapType::Field {
+            Area::Field
+        } else {
+            Area::Dungeon
+        };
+        log::info!(
+            "game: map {id} {} type={:?} -> {}",
+            data.developmentName,
+            data.MapType,
+            area.label()
+        );
+        Some((area, data.MapType == EeMapType::VisionSmallShrine))
+    }
+
     fn bgm_sheet_name() -> String {
         UCPP_SoundManager::GetCueSheetNameBGM().ToString()
     }
