@@ -92,6 +92,10 @@ active window.
   from the Hidden tab.
 - **Play from** picks the list Next and Shuffle draw from; **Music for** picks a separate one for battles,
   the field, towns or dungeons.
+- **Controller with extra buttons?** Back paddles, grip buttons and the like (Xbox Elite, DualSense Edge,
+  Steam Deck, Steam Controller) can do it in one tap: with Steam Input on for the game (right-click it in
+  your Steam library > Properties > Controller), bind a spare button to a jukebox key in the controller
+  layout, e.g. **F9** for the menu or **8** for play/pause.
 
 ## Good to know
 
@@ -102,10 +106,6 @@ active window.
   cutscenes are covered by the "Exploring, Battling, and Cutscenes" mode.
 - While the combo's hold button (LT) is down, the game doesn't see the combo buttons or the right stick;
   LT itself still reaches the game.
-- **Controller with extra buttons?** Back paddles, grip buttons and the like (Xbox Elite, DualSense Edge,
-  Steam Deck, Steam Controller) can do it in one tap: with Steam Input on for the game (right-click it in
-  your Steam library > Properties > Controller), bind a spare button to a jukebox key in the controller
-  layout, e.g. **F9** for the menu or **8** for play/pause.
 - Single-player only; nothing is sent anywhere.
 
 ## Troubleshooting
