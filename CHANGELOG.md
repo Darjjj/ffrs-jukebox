@@ -9,8 +9,7 @@
   skipping ahead; turned off, the next song plays after each battle.
 - Save points no longer hand the music back to the game.
 - A song the game won't start in one place is skipped there instead of being removed from your lists
-  for good. (Songs removed this way before can be brought back: delete their lines under `unplayable`
-  in `ffrs_jukebox.toml` while the game is closed.)
+  for good.
 - Thanks to Cloudjr5 for the suggestions.
 
 ## 1.4.2 - 2026-10-28
