@@ -109,6 +109,15 @@ pub struct Player {
     /// to pick up again once the battle ends.
     in_battle: bool,
     battle_resume: Option<(usize, f32)>,
+    /// In a battle the exploring song carries on or waits through (no
+    /// battle music list, or a boss keeping its music), and where that song
+    /// was as it began.
+    fight: bool,
+    fight_resume: Option<(usize, f32)>,
+    /// The map last settled on while exploring, and a different one seen
+    /// since and when it was first seen.
+    map_id: i32,
+    map_new: Option<(i32, Instant)>,
     /// The next start is a change of song, so it crossfades.
     crossfade_next: bool,
     /// When the current song started fading in, and over how long.
@@ -128,6 +137,9 @@ pub struct Player {
     after_fanfare: bool,
 }
 
+/// How long a new map has to hold before it counts as entered.
+const MAP_SETTLE: Duration = Duration::from_millis(1500);
+
 /// How often the current song and position are saved for resuming.
 const RESUME_SAVE_EVERY: Duration = Duration::from_secs(10);
 
@@ -145,6 +157,10 @@ impl Player {
             ramped: 0.0,
             bags: std::collections::HashMap::new(),
             in_battle: false,
+            fight: false,
+            fight_resume: None,
+            map_id: 0,
+            map_new: None,
             battle_resume: None,
             crossfade_next: false,
             fade_in: None,
@@ -196,9 +212,88 @@ impl Player {
             log::info!("player: battle, switching to the battle music");
             self.advance_from(game, false, None);
         } else if let Some((i, at)) = self.battle_resume.take() {
-            log::info!("player: battle over, back to the exploring song at {at:.0}s");
             self.crossfade_next = true;
+            if state::lock().config.resume_after_battle {
+                log::info!("player: battle over, back to the exploring song at {at:.0}s");
+                self.start_at(i, at, game);
+            } else {
+                log::info!("player: battle over, on to the next exploring song");
+                self.advance_from(game, false, Some(i));
+            }
+        }
+    }
+
+    /// A battle without the battle music: the exploring song waits through
+    /// it (or plays on), and picks up where it was after. One the game cut
+    /// off meanwhile starts again there; with the setting off, the next
+    /// song plays instead.
+    fn follow_fight(&mut self, game: &mut Game, fight: bool) {
+        if fight == self.fight {
+            return;
+        }
+        self.fight = fight;
+        if fight {
+            self.fight_resume = if self.in_battle { None } else { self.position(game) };
+            return;
+        }
+        let Some((i, at)) = self.fight_resume.take() else { return };
+        // Another song chosen during the battle stays.
+        if self.now.as_ref().map(|(c, _)| *c) != Some(i) {
+            return;
+        }
+        let alive = match &self.now {
+            Some((_, Playing::Cue { id, .. })) => game.exists(*id),
+            Some((_, Playing::File { sink, .. })) => !sink.empty(),
+            None => false,
+        };
+        if !state::lock().config.resume_after_battle {
+            log::info!("player: battle over, on to the next exploring song");
+            self.crossfade_next = true;
+            self.advance_from(game, false, Some(i));
+        } else if !alive {
+            log::info!("player: battle over, the exploring song was cut off; again from {at:.0}s");
             self.start_at(i, at, game);
+        }
+    }
+
+    /// Entering another map moves on to the next song, if that's the
+    /// setting. Only maps seen while exploring count, so a battle or a
+    /// story scene in between doesn't.
+    fn follow_map(&mut self, game: &mut Game, scene: crate::config::Scene, play_in: crate::config::PlayIn) {
+        if scene != crate::config::Scene::Exploring {
+            return;
+        }
+        let id = game.map_id();
+        if id <= 0 || id == self.map_id {
+            self.map_new = None;
+            return;
+        }
+        // A map change passes through loading maps for a moment; only one
+        // that holds counts, and by then the game has finished loading it.
+        match self.map_new {
+            Some((new, since)) if new == id => {
+                if since.elapsed() < MAP_SETTLE {
+                    return;
+                }
+            }
+            _ => {
+                self.map_new = Some((id, Instant::now()));
+                if self.map_id > 0 {
+                    return;
+                }
+            }
+        }
+        self.map_new = None;
+        let old = std::mem::replace(&mut self.map_id, id);
+        log::info!("player: map {old} -> {id}");
+        let (on, playing) = {
+            let s = state::lock();
+            (s.config.new_song_on_new_map, s.playing)
+        };
+        if old > 0 && on && playing && play_in.covers(scene) && self.now.is_some() {
+            log::info!("player: new map, next song");
+            self.crossfade_next = true;
+            self.advance(game, false);
         }
     }
 
@@ -357,6 +452,8 @@ impl Player {
         let boss = scene == crate::config::Scene::Battle && game.boss_battle();
         let boss_held = boss && boss_setting;
         self.follow_battle(game, scene, play_in, boss_held);
+        self.follow_fight(game, scene == crate::config::Scene::Battle);
+        self.follow_map(game, scene, play_in);
         self.run_check(game);
         self.fade_files();
 
@@ -432,10 +529,20 @@ impl Player {
             self.now = None;
             self.retry = Some((i, attempt, Instant::now() + CUE_RETRY_DELAY));
         } else if let Some(i) = failed {
-            let title = state::lock().tracks.get(i).map(|t| t.title.clone()).unwrap_or_default();
-            log::error!("player: the game would not play {title}");
+            let (title, checked) = {
+                let s = state::lock();
+                (s.tracks.get(i).map(|t| t.title.clone()).unwrap_or_default(), s.config.checked_build == s.config.game_build)
+            };
             self.stop(game);
-            state::lock().set_unplayable(i, true);
+            // Once every song has been checked on this game version, a song
+            // that fails now is only out of reach here (some places hold
+            // part of the soundtrack back), so it's skipped, not removed.
+            if checked {
+                log::warn!("player: the game would not play {title} here, skipping it");
+            } else {
+                log::error!("player: the game would not play {title}");
+                state::lock().set_unplayable(i, true);
+            }
             if self.auto {
                 // Reached by Next, Shuffle or a playlist: go on to the song
                 // after it.
@@ -443,9 +550,11 @@ impl Player {
             } else {
                 let mut s = state::lock();
                 s.playing = false;
-                s.error = Some(format!(
-                    "{title} has no audio in the game's files, so it was removed from the list."
-                ));
+                s.error = Some(if checked {
+                    format!("The game won't play {title} here. Try it again somewhere else.")
+                } else {
+                    format!("{title} has no audio in the game's files, so it was removed from the list.")
+                });
             }
         } else if finished {
             self.advance(game, true);

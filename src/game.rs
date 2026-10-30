@@ -10,7 +10,7 @@ use sdk::CriWareRuntime::{FAtomCueInfo, UManaPlayer, USoundAtomCueSheet};
 use sdk::Engine::USubsystemBlueprintLibrary;
 use sdk::UMG::{UEditableText, UEditableTextBox, UMultiLineEditableText, UMultiLineEditableTextBox, UWidget};
 use sdk::mucha::{
-    EeSoundCategory, EeSoundVolumeType, FPLAY_SOUND_PARAMETER, UCPP_BFL_Battle, UCPP_BFL_TalkEvent, UCPP_SoundManager,
+    EeSoundCategory, EeSoundVolumeType, FPLAY_SOUND_PARAMETER, UCPP_BFL_Battle, UCPP_BFL_Map, UCPP_BFL_TalkEvent, UCPP_SoundManager,
     UCPP_UI_BattleSubsystem,
 };
 use sdk::rt::{self, FAllocatedString, TSubclassOf, UClassType};
@@ -198,15 +198,16 @@ thread_local! {
 
 /// Event categories that are everyday talk rather than story: townsfolk
 /// ("AtcRestartTalk"), shops, inns and upgrades ("Shop"), boarding the airship
-/// ("Gimmick"), notices on a bulletin board ("SignboardGimmick") and the
-/// summon trainers ("Summon"). Story scenes are filed by chapter
+/// ("Gimmick"), notices on a bulletin board ("SignboardGimmick"), the
+/// summon trainers ("Summon") and save points ("MoveGimmick"). Story scenes are filed by chapter
 /// ("Event.Category.C01"); anything not listed here still counts as one.
-const TALK_CATEGORIES: [&str; 5] = [
+const TALK_CATEGORIES: [&str; 6] = [
     "Event.Category.AtcRestartTalk",
     "Event.Category.Shop",
     "Event.Category.Gimmick",
     "Event.Category.SignboardGimmick",
     "Event.Category.Summon",
+    "Event.Category.MoveGimmick",
 ];
 
 /// When everyday talk was last seen. A bulletin board's list, then a notice,
@@ -330,6 +331,15 @@ impl Game {
         let boss = UCPP_BFL_Battle::IsBossBattle();
         crate::log_change("boss", format!("game: boss battle={boss}"));
         boss
+    }
+
+    /// The map the player is on (a town, a field, a dungeon); 0 before one
+    /// is loaded.
+    pub fn map_id(&mut self) -> i32 {
+        if !self.ready() {
+            return 0;
+        }
+        UCPP_BFL_Map::GetCurrentMapId()
     }
 
     fn bgm_sheet_name() -> String {

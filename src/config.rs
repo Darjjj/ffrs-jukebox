@@ -193,6 +193,11 @@ pub struct Config {
     pub battle_shuffle: bool,
     /// Keep the battle song picked as a fight starts on a loop until it ends.
     pub loop_battle_song: bool,
+    /// After a battle, pick the exploring song up where it was; off plays
+    /// the next song instead.
+    pub resume_after_battle: bool,
+    /// Move on to the next song on entering another map (a town, a field).
+    pub new_song_on_new_map: bool,
     /// Tuck the mini player away during cutscenes; it comes back after.
     pub mini_hide_in_cutscenes: bool,
     /// Tuck the mini player away while talking to someone or reading a sign.
@@ -278,6 +283,8 @@ impl Default for Config {
             boss_game_music: true,
             battle_shuffle: true,
             loop_battle_song: false,
+            resume_after_battle: true,
+            new_song_on_new_map: false,
             mini_hide_in_cutscenes: true,
             mini_hide_while_talking: false,
             controller: true,
@@ -544,7 +551,7 @@ mod tests {
         let old: Config = toml::from_str("shuffle = false\nbattle_toast = false\nvictory_fanfare = true").unwrap();
         assert!(!old.shuffle && !old.battle_toast);
         assert!(old.boss_game_music && old.battle_shuffle && old.mini_hide_in_cutscenes);
-        assert!(!old.loop_battle_song);
+        assert!(!old.loop_battle_song && old.resume_after_battle && !old.new_song_on_new_map);
         assert!(!old.mini_hide_while_talking);
         assert_eq!(old.settings_size, None);
         // An unset window size isn't written out.

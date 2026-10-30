@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.0 - 2026-10-29
+
+- New setting, "New song on a new map" (General tab, off by default): entering another map, such as
+  from the field into a town, moves on to the next song once the map has loaded.
+- New setting, "Pick up where it left off after battles" (Battles tab, on by default). Without a
+  battle music list, a song the game cut off during a battle now starts again where it was rather than
+  skipping ahead; turned off, the next song plays after each battle.
+- Save points no longer hand the music back to the game.
+- A song the game won't start in one place is skipped there instead of being removed from your lists
+  for good. (Songs removed this way before can be brought back: delete their lines under `unplayable`
+  in `ffrs_jukebox.toml` while the game is closed.)
+- Thanks to Cloudjr5 for the suggestions.
+
 ## 1.4.2 - 2026-10-28
 
 - Vision attacks no longer interrupt your battle song. Their movie was mistaken for the battle ending, so

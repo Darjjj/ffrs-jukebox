@@ -24,7 +24,9 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
   (a setting, on by default).
 - **Battle popup.** The now-playing popup shows the current song when a battle starts and ends (a setting,
   on by default).
-- **Keeps playing while you talk.** Townsfolk, shops, the inn and bulletin boards don't interrupt your
+- **New song on a new map.** Entering a town or another area can move on to the next song (a setting,
+  off by default).
+- **Keeps playing while you talk.** Townsfolk, shops, the inn, bulletin boards and save points don't interrupt your
   music; only story scenes count as cutscenes.
 - **Favorites, playlists, hide and rename** any song, from a right-click menu.
 - **Shuffle without repeats** (battle music has a Shuffle of its own), a one-click **repeat** button (off, playlist, song), **crossfade** between songs, and **resume** the last

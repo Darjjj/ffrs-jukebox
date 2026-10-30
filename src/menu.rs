@@ -464,6 +464,12 @@ impl Menu {
                         "When the game starts, carry on with the song you were\nplaying last time, where you left it. Stop clears it.",
                         &mut s.config.resume_on_start,
                     );
+                    changed |= option(
+                        ui,
+                        "New song on a new map",
+                        "Moves on to the next song when you enter another map,\nsuch as from the field into a town.",
+                        &mut s.config.new_song_on_new_map,
+                    );
                     section(ui, "Mini player");
                     changed |= option(
                         ui,
@@ -492,6 +498,13 @@ impl Menu {
                         "Keeps the song picked as a battle starts playing on a
 loop until the battle ends, instead of moving on.",
                         &mut s.config.loop_battle_song,
+                    );
+                    changed |= option(
+                        ui,
+                        "Pick up where it left off after battles",
+                        "After a battle, your exploring song carries on from where it
+was when the battle started. Off: the next song plays instead.",
+                        &mut s.config.resume_after_battle,
                     );
                     changed |= option(
                         ui,
