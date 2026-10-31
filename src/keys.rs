@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+use windows::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, PAGE_READWRITE, VirtualProtect};
 use windows::Win32::UI::Input::XboxController::{
     XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT,
     XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB,
@@ -225,9 +226,11 @@ impl PadState {
 }
 
 // What the game is shown of the controller. The game reads it through
-// XInputGetState in XINPUT1_4.dll; that function is hooked so the jukebox
-// can keep buttons to itself: the combo buttons while the hold button is
-// down, and everything while the menu is being driven with the controller.
+// XInputGetState in XINPUT1_4.dll, delay-loaded; its import slot for that
+// function is pointed here so the jukebox can keep buttons to itself: the
+// combo buttons while the hold button is down, and everything while the menu
+// is being driven with the controller. The function itself is left unpatched:
+// patching it stopped the game getting any controller input.
 
 /// Buttons (`wButtons` bits) hidden from the game right now.
 static HIDE_BUTTONS: AtomicU16 = AtomicU16::new(0);
@@ -237,6 +240,12 @@ static HIDE_ALL: AtomicBool = AtomicBool::new(false);
 static HIDE_RIGHT_STICK: AtomicBool = AtomicBool::new(false);
 /// XInputGetState as it was before the hook, for the jukebox's own reads.
 static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// The game's import slot for XInputGetState, once found.
+static SLOT: AtomicUsize = AtomicUsize::new(0);
+/// XInputGetState in XINPUT1_4.dll.
+static REAL: AtomicUsize = AtomicUsize::new(0);
+/// Where the game's exe sits in memory: start and end.
+static EXE: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
 type GetState = unsafe extern "system" fn(u32, *mut XINPUT_STATE) -> u32;
 
@@ -259,8 +268,67 @@ unsafe extern "system" fn get_state_hook(slot: u32, state: *mut XINPUT_STATE) ->
     result
 }
 
-/// Hooks the game's XInputGetState. Without it the combos still work, the
-/// game just sees their buttons too.
+/// The game's delay-import slot for `function` in `dll`, read from its PE
+/// headers, and the size of its image.
+unsafe fn delay_import_slot(base: usize, dll: &str, function: &str) -> Option<(usize, usize)> {
+    let u32_at = |at: usize| unsafe { std::ptr::read_unaligned((base + at) as *const u32) } as usize;
+    let c_str = |at: usize| unsafe { std::ffi::CStr::from_ptr((base + at) as *const _) }.to_str().unwrap_or("");
+    let optional = u32_at(0x3C) + 24;
+    let image_size = u32_at(optional + 56);
+    let mut descriptor = u32_at(optional + 112 + 13 * 8);
+    if descriptor == 0 {
+        return None;
+    }
+    while u32_at(descriptor + 4) != 0 {
+        if c_str(u32_at(descriptor + 4)).eq_ignore_ascii_case(dll) {
+            let (slots, names) = (u32_at(descriptor + 12), u32_at(descriptor + 16));
+            for i in 0.. {
+                let name = unsafe { std::ptr::read_unaligned((base + names + i * 8) as *const u64) };
+                if name == 0 {
+                    return None;
+                }
+                if name >> 63 == 0 && c_str(name as usize + 2) == function {
+                    return Some((base + slots + i * 8, image_size));
+                }
+            }
+        }
+        descriptor += 32;
+    }
+    None
+}
+
+/// Points the game's import slot at the hook, unless it's there already. Until
+/// the game's first call the slot holds its delay-load stub, which would write
+/// the real function back over the hook, so that's never called. A real
+/// function or another mod's hook found there is kept and called from the hook.
+fn keep_hooked() {
+    let slot = SLOT.load(Ordering::Relaxed) as *mut usize;
+    if slot.is_null() {
+        return;
+    }
+    let hook = get_state_hook as *const () as usize;
+    let found = unsafe { std::ptr::read_volatile(slot) };
+    if found == hook {
+        return;
+    }
+    let in_exe = (EXE[0].load(Ordering::Relaxed)..EXE[1].load(Ordering::Relaxed)).contains(&found);
+    let next = if in_exe { REAL.load(Ordering::Relaxed) } else { found };
+    ORIGINAL.store(next, Ordering::Relaxed);
+    let mut old = PAGE_PROTECTION_FLAGS(0);
+    let size = size_of::<usize>();
+    if unsafe { VirtualProtect(slot as *const _, size, PAGE_READWRITE, &mut old) }.is_err() {
+        log::warn!("keys: couldn't write the game's XInputGetState import, the game will see the combo buttons too");
+        SLOT.store(0, Ordering::Relaxed);
+        return;
+    }
+    unsafe {
+        std::ptr::write_volatile(slot, hook);
+        let _ = VirtualProtect(slot as *const _, size, old, &mut old);
+    }
+}
+
+/// Hooks the game's calls to XInputGetState. Without it the combos still work,
+/// the game just sees their buttons too.
 pub fn hook_xinput() {
     let Ok(module) = (unsafe { GetModuleHandleA(windows::core::s!("XINPUT1_4.dll")) }) else {
         log::warn!("keys: XINPUT1_4.dll isn't loaded, the game will see the combo buttons too");
@@ -270,15 +338,21 @@ pub fn hook_xinput() {
         log::warn!("keys: no XInputGetState, the game will see the combo buttons too");
         return;
     };
-    match grapnel::InlineHook::install(target as *mut u8, get_state_hook as *const u8) {
-        Ok(hook) => {
-            ORIGINAL.store(hook.original::<usize>(), Ordering::Relaxed);
-            // The hook stays for the life of the game.
-            std::mem::forget(hook);
-            log::info!("keys: XInputGetState hooked");
-        }
-        Err(e) => log::warn!("keys: could not hook XInputGetState ({e}), the game will see the combo buttons too"),
-    }
+    let Ok(exe) = (unsafe { GetModuleHandleA(None) }) else {
+        log::warn!("keys: no game module, the game will see the combo buttons too");
+        return;
+    };
+    let base = exe.0 as usize;
+    let Some((slot, size)) = (unsafe { delay_import_slot(base, "XINPUT1_4.dll", "XInputGetState") }) else {
+        log::warn!("keys: the game has no delay import of XInputGetState, it will see the combo buttons too");
+        return;
+    };
+    REAL.store(target as usize, Ordering::Relaxed);
+    EXE[0].store(base, Ordering::Relaxed);
+    EXE[1].store(base + size, Ordering::Relaxed);
+    SLOT.store(slot, Ordering::Relaxed);
+    keep_hooked();
+    log::info!("keys: game's XInputGetState import hooked");
 }
 
 /// Reads one controller slot past the hook, as it really is.
@@ -364,6 +438,7 @@ impl PadPoll {
 /// button. While the hold button is down, the action buttons are kept from
 /// the game; `navigating` hides the whole controller from it.
 pub fn combos(now: &PadState, fresh: &[PadButton], b: &PadBinds, on: bool, navigating: bool) -> Vec<PadEvent> {
+    keep_hooked();
     HIDE_ALL.store(navigating, Ordering::Relaxed);
     let actions = [
         (b.previous, PadEvent::Previous),
