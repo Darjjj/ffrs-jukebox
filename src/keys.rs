@@ -7,10 +7,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
+    GetModuleHandleA, GetModuleHandleExW,
+};
+use windows::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, PAGE_READWRITE, VirtualProtect};
 use windows::Win32::UI::Input::XboxController::{
     XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT,
     XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB,
@@ -224,10 +229,16 @@ impl PadState {
     }
 }
 
-// What the game is shown of the controller. The game reads it through
-// XInputGetState in XINPUT1_4.dll; that function is hooked so the jukebox
-// can keep buttons to itself: the combo buttons while the hold button is
-// down, and everything while the menu is being driven with the controller.
+// What the game is shown of the controller, so the jukebox can keep buttons
+// to itself: the combo buttons while the hold button is down, and everything
+// while the menu is being driven with the controller.
+//
+// Only the game's own call is rerouted: its import-table entry for
+// XInputGetState (delay-loaded from XINPUT1_4.dll) is pointed at a filter
+// that calls on to whatever the entry held. XInputGetState itself is never
+// patched. Steam Input makes a DualSense or any other pad look like an Xbox
+// one by hooking that function in the game's process; patching it as well
+// (as 1.6.0 did) left Steam's layer out, and those pads stopped working.
 
 /// Buttons (`wButtons` bits) hidden from the game right now.
 static HIDE_BUTTONS: AtomicU16 = AtomicU16::new(0);
@@ -235,14 +246,30 @@ static HIDE_BUTTONS: AtomicU16 = AtomicU16::new(0);
 static HIDE_ALL: AtomicBool = AtomicBool::new(false);
 /// The right stick is hidden from the game (it's moving the jukebox).
 static HIDE_RIGHT_STICK: AtomicBool = AtomicBool::new(false);
-/// XInputGetState as it was before the hook, for the jukebox's own reads.
-static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// What the game's import entry held before the filter took its place:
+/// XInputGetState, or Steam's hook of it.
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+/// How many times the filter has (re)claimed the entry. Something that keeps
+/// taking it back wins after a few tries; the filter then stays out of the way.
+static CLAIMS: AtomicU32 = AtomicU32::new(0);
+const MAX_CLAIMS: u32 = 4;
 
 type GetState = unsafe extern "system" fn(u32, *mut XINPUT_STATE) -> u32;
 
-unsafe extern "system" fn get_state_hook(slot: u32, state: *mut XINPUT_STATE) -> u32 {
-    let original: GetState = unsafe { std::mem::transmute(ORIGINAL.load(Ordering::Relaxed)) };
-    let result = unsafe { original(slot, state) };
+thread_local! {
+    /// The filter is running on this thread, so a call that comes back round
+    /// to it goes straight to XInput instead of looping.
+    static IN_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+unsafe extern "system" fn get_state_filter(slot: u32, state: *mut XINPUT_STATE) -> u32 {
+    let next = NEXT.load(Ordering::Relaxed);
+    if next == 0 || IN_FILTER.get() {
+        return unsafe { XInputGetState(slot, state) };
+    }
+    IN_FILTER.set(true);
+    let result = unsafe { std::mem::transmute::<usize, GetState>(next)(slot, state) };
+    IN_FILTER.set(false);
     if result == 0 {
         if let Some(s) = unsafe { state.as_mut() } {
             if HIDE_ALL.load(Ordering::Relaxed) {
@@ -259,34 +286,114 @@ unsafe extern "system" fn get_state_hook(slot: u32, state: *mut XINPUT_STATE) ->
     result
 }
 
-/// Hooks the game's XInputGetState. Without it the combos still work, the
-/// game just sees their buttons too.
-pub fn hook_xinput() {
-    let Ok(module) = (unsafe { GetModuleHandleA(windows::core::s!("XINPUT1_4.dll")) }) else {
-        log::warn!("keys: XINPUT1_4.dll isn't loaded, the game will see the combo buttons too");
-        return;
-    };
-    let Some(target) = (unsafe { GetProcAddress(module, windows::core::s!("XInputGetState")) }) else {
-        log::warn!("keys: no XInputGetState, the game will see the combo buttons too");
-        return;
-    };
-    match grapnel::InlineHook::install(target as *mut u8, get_state_hook as *const u8) {
-        Ok(hook) => {
-            ORIGINAL.store(hook.original::<usize>(), Ordering::Relaxed);
-            // The hook stays for the life of the game.
-            std::mem::forget(hook);
-            log::info!("keys: XInputGetState hooked");
+/// The game's delay-load import entry for XINPUT1_4.dll's XInputGetState,
+/// and the game exe's address range.
+struct Entry {
+    slot: *mut usize,
+    exe: std::ops::Range<usize>,
+}
+
+unsafe impl Send for Entry {}
+unsafe impl Sync for Entry {}
+
+fn find_entry() -> Option<Entry> {
+    let base = unsafe { GetModuleHandleA(None) }.ok()?.0 as usize;
+    let u32_at = |off: usize| unsafe { std::ptr::read_unaligned((base + off) as *const u32) } as usize;
+    let nt = u32_at(0x3C);
+    let size = u32_at(nt + 0x18 + 0x38);
+    // The delay-load directory is entry 13 of the data directories.
+    let delay = u32_at(nt + 0x18 + 0x70 + 13 * 8);
+    if delay == 0 {
+        return None;
+    }
+    let c_str = |rva: usize| unsafe { std::ffi::CStr::from_ptr((base + rva) as *const std::ffi::c_char) };
+    let mut d = base + delay;
+    loop {
+        // Attributes, DllName, ModuleHandle, IAT, INT (RVAs), 32 bytes each.
+        let field = |i: usize| unsafe { std::ptr::read_unaligned((d + i * 4) as *const u32) } as usize;
+        let name = field(1);
+        if name == 0 {
+            return None;
         }
-        Err(e) => log::warn!("keys: could not hook XInputGetState ({e}), the game will see the combo buttons too"),
+        if c_str(name).to_bytes().eq_ignore_ascii_case(b"XINPUT1_4.dll") {
+            let (iat, names) = (field(3), field(4));
+            for i in 0.. {
+                let thunk = unsafe { std::ptr::read_unaligned((base + names + i * 8) as *const u64) };
+                if thunk == 0 {
+                    return None;
+                }
+                // By ordinal (XInputGetState is ordinal 2) or by name.
+                let hit = if thunk >> 63 == 1 {
+                    thunk & 0xFFFF == 2
+                } else {
+                    c_str(thunk as usize + 2).to_bytes() == b"XInputGetState"
+                };
+                if hit {
+                    return Some(Entry { slot: (base + iat + i * 8) as *mut usize, exe: base..base + size });
+                }
+            }
+        }
+        d += 32;
     }
 }
 
-/// Reads one controller slot past the hook, as it really is.
-fn read_slot(slot: u32, s: &mut XINPUT_STATE) -> u32 {
-    match ORIGINAL.load(Ordering::Relaxed) {
-        0 => unsafe { XInputGetState(slot, s) },
-        f => unsafe { std::mem::transmute::<usize, GetState>(f)(slot, s) },
+/// Keeps the game's XInputGetState entry pointing at the filter. Called every
+/// frame: the entry only holds the real function after the game's first call
+/// (until then it points at the delay-load stub inside the exe), and Steam may
+/// put its own hook there later, which the filter then calls on to.
+pub fn keep_xinput_filtered() {
+    static ENTRY: std::sync::OnceLock<Option<Entry>> = std::sync::OnceLock::new();
+    let Some(entry) = ENTRY.get_or_init(|| {
+        let e = find_entry();
+        if e.is_none() {
+            log::warn!("keys: no XInputGetState import in the game, the game will see the combo buttons too");
+        }
+        e
+    }) else {
+        return;
+    };
+    let filter = get_state_filter as *const () as usize;
+    let now = unsafe { std::ptr::read_volatile(entry.slot) };
+    // Not resolved yet, already ours, or given up on.
+    if now == filter || entry.exe.contains(&now) || CLAIMS.load(Ordering::Relaxed) >= MAX_CLAIMS {
+        return;
     }
+    let claims = CLAIMS.fetch_add(1, Ordering::Relaxed) + 1;
+    if claims >= MAX_CLAIMS {
+        log::warn!("keys: something keeps taking the game's XInputGetState entry back; leaving it be");
+        return;
+    }
+    NEXT.store(now, Ordering::Relaxed);
+    let mut old = PAGE_PROTECTION_FLAGS(0);
+    let slot = entry.slot as *const std::ffi::c_void;
+    if unsafe { VirtualProtect(slot, 8, PAGE_READWRITE, &mut old) }.is_err() {
+        log::warn!("keys: could not reroute the game's XInputGetState");
+        return;
+    }
+    unsafe { std::ptr::write_volatile(entry.slot, filter) };
+    let _ = unsafe { VirtualProtect(slot, 8, old, &mut old) };
+    log::info!("keys: game's XInputGetState rerouted through the jukebox, calling on to {}", module_of(now));
+}
+
+/// Which module an address is in, for the log: "XINPUT1_4.dll" when the game
+/// calls XInput directly, Steam's overlay when Steam Input sits in between.
+fn module_of(addr: usize) -> String {
+    let mut module = HMODULE::default();
+    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    if unsafe { GetModuleHandleExW(flags, windows::core::PCWSTR(addr as *const u16), &mut module) }.is_err() {
+        return format!("{addr:#x}");
+    }
+    let mut buf = [0u16; 260];
+    let len = unsafe { GetModuleFileNameW(module, &mut buf) } as usize;
+    let path = String::from_utf16_lossy(&buf[..len]);
+    let name = path.rsplit('\\').next().unwrap_or(&path);
+    format!("{name}+{:#x}", addr - module.0 as usize)
+}
+
+/// Reads one controller slot as the jukebox sees it: through XInput as is,
+/// Steam Input included, never through the filter.
+fn read_slot(slot: u32, s: &mut XINPUT_STATE) -> u32 {
+    unsafe { XInputGetState(slot, s) }
 }
 
 /// What the controller asked of the jukebox this frame.

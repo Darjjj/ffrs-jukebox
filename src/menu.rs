@@ -221,6 +221,7 @@ impl Menu {
         }
         // Controller combos: hold one button and press another. Read every
         // frame, so a press only counts once.
+        keys::keep_xinput_filtered();
         let (now, fresh) = self.pad.read();
         self.pad_now = now;
         let (binds, on) = {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.1 - 2026-10-31
+
+- Fixed DualSense and other controllers that go through Steam Input not working in game since 1.6.0.
+  The jukebox no longer patches XInput itself; it only reroutes the game's own calls, so Steam's
+  controller support stays in the chain. Thanks to SenpaiOppai3 for the heads up on the bug.
+
 ## 1.6.0 - 2026-10-30 - Improved controller support
 
 - Controller combos are rebindable in the Controls tab: the button to hold (LT by default) and each

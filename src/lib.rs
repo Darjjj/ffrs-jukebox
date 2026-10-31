@@ -100,8 +100,6 @@ fn main(this_module: HMODULE) {
     log::info!("main: {} files in {}", tracks.len(), music_dir.display());
     state::init(state::Shared { config, config_path, music_dir, tracks, ..Default::default() });
     state::lock().apply_titles();
-    // The controller combos keep their buttons from the game.
-    keys::hook_xinput();
 
     // Game-thread entry for the player: inside UObject::ProcessEvent, not at its
     // entry. The ultrawide fix finds ProcessEvent by its first 0x55 bytes, so a

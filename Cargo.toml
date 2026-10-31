@@ -1,6 +1,6 @@
 [package]
 name = "ffrs-jukebox"
-version = "1.6.0"
+version = "1.6.1"
 edition = "2024"
 license = "MIT"
 description = "In-game jukebox for FINAL FANTASY RESONANCE"
@@ -23,6 +23,7 @@ fern = "0.7"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
