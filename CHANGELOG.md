@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.2 - 2026-11-02
+
+- One-step install: the zip now holds a single FFRS folder with everything in it, Ultimate ASI Loader
+  included, to drag into the FINAL FANTASY RESONANCE folder. The readme, changelog and license no longer
+  land loose in the game folder; they're on Nexus and GitHub. The loader's license sits next to it in
+  Win64\, so scripts\ only holds the jukebox's own files.
+
 ## 1.6.1 - 2026-10-31
 
 - Fixed DualSense and other controllers that go through Steam Input not working in game since 1.6.0.

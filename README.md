@@ -54,22 +54,24 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
 
 ## Requirements
 
-- FINAL FANTASY RESONANCE (Steam, Windows).
-- An ASI loader: [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) as `winmm.dll`.
-  If you already use [PolarWizard's ultrawide fix](https://github.com/PolarWizard/final-fantasy-resonance-fix),
-  you have it.
+- FINAL FANTASY RESONANCE (Steam, Windows). Everything else is in the zip, including the ASI loader
+  ([Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)) that loads the jukebox.
 
 ## Install
 
-1. If you don't have an ASI loader yet, put Ultimate ASI Loader's `winmm.dll` in
-   `FINAL FANTASY RESONANCE\FFRS\Binaries\Win64\`.
-2. Copy `ffrs_jukebox.asi` into `FINAL FANTASY RESONANCE\FFRS\Binaries\Win64\scripts\` (create `scripts` if
-   it isn't there).
-3. Start the game. The `jukebox` folder for your own music and `ffrs_jukebox.toml` appear next to the `.asi`
-   on the first run.
+Drag the **FFRS** folder from the zip into your `FINAL FANTASY RESONANCE` folder (in Steam: right-click the
+game > Manage > Browse local files). If Windows asks about files that are already there, choose **Replace**.
+Then start the game and press **F9**.
 
-**Uninstall:** delete `ffrs_jukebox.asi`, `ffrs_jukebox.toml`, `ffrs_jukebox.log` and the `jukebox` folder from
-`scripts\`.
+![Drag the FFRS folder from the zip into the game folder](docs/install/install.png)
+
+That puts `winmm.dll` (the ASI loader) in `FFRS\Binaries\Win64\` and the jukebox in
+`FFRS\Binaries\Win64\scripts\`. The `jukebox` folder for your own music and `ffrs_jukebox.toml` appear next to
+the jukebox on the first run.
+
+**Uninstall:** delete `ffrs_jukebox.asi`, `ffrs_jukebox.toml`, `ffrs_jukebox.log` and the `jukebox` folder (your
+own music) from `scripts\`. If no other mod uses the ASI loader, also delete `winmm.dll` and
+`Ultimate-ASI-Loader_LICENSE.txt` from `Win64\`; the ultrawide fix needs them.
 
 ## Using it
 
@@ -130,6 +132,8 @@ The build is `target\release\ffrs_jukebox.dll`; rename it to `ffrs_jukebox.asi`.
 
 - Game SDK (generated with [Dumper-7](https://github.com/Encryqed/Dumper-7)) from
   [PolarWizard's FINAL FANTASY RESONANCE fix](https://github.com/PolarWizard/final-fantasy-resonance-fix), MIT.
+- [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) by ThirteenAG (MIT), included as
+  `winmm.dll`; its license is next to it, in `Win64\Ultimate-ASI-Loader_LICENSE.txt`.
 - [hudhook](https://github.com/veeenu/hudhook) and [Dear ImGui](https://github.com/ocornut/imgui) for the
   overlay, [rodio](https://github.com/RustAudio/rodio) / [Symphonia](https://github.com/pdeljanov/Symphonia)
   for your own music, [grapnel](https://crates.io/crates/grapnel) for the game hook.
