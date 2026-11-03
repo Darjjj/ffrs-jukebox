@@ -2,6 +2,7 @@
 
 ## 1.6.2 - 2026-11-02
 
+- No gameplay changes: the jukebox is the same as 1.6.1; only the download is packaged differently.
 - One-step install: the zip now holds a single FFRS folder with everything in it, Ultimate ASI Loader
   included, to drag into the FINAL FANTASY RESONANCE folder. The readme, changelog and license no longer
   land loose in the game folder; they're on Nexus and GitHub. The loader's license sits next to it in
