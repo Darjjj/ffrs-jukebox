@@ -40,6 +40,14 @@ fn output() -> Option<&'static OutputStreamHandle> {
         .as_ref()
 }
 
+/// Opens the audio output ahead of time, off the game thread, so the first
+/// file to play doesn't wait for the device.
+pub fn warm_up() {
+    std::thread::spawn(|| {
+        output();
+    });
+}
+
 /// How long a game cue may take to start before it counts as failed. Some
 /// cues are not reported as playing for a moment after PlaySound2D, while
 /// the game loads them.
@@ -193,15 +201,54 @@ impl Player {
 
     /// The list Next and Shuffle draw from right now: the battle music
     /// during a battle that has one, else this kind of place's own list,
-    /// else "Play from".
+    /// else "Play from". A battle or area list with nothing playable in it
+    /// (a folder emptied, every song hidden) falls back to "Play from" too,
+    /// rather than to every song.
     fn list_now(&self, s: &state::Shared) -> Playlist {
-        match (&s.config.battle_playlist, self.in_battle) {
-            (Some(b), true) => b.clone(),
+        let own = match (&s.config.battle_playlist, self.in_battle) {
+            (Some(b), true) => Some(b),
             _ => match self.area.map(|a| s.config.area_music(a)) {
-                Some(AreaMusic::List(p)) => p.clone(),
-                _ => s.config.playlist.clone(),
+                Some(AreaMusic::List(p)) => Some(p),
+                _ => None,
             },
+        };
+        match own {
+            Some(list) if s.songs_of_only(list, None).is_some() => list.clone(),
+            _ => s.config.playlist.clone(),
         }
+    }
+
+    /// Whether a natural end of `current` ends the playlist too: Repeat is
+    /// off and it is the last song, or with Shuffle, the last of the deal.
+    /// Such a song plays out to its end instead of crossfading into nothing.
+    fn ends_playlist(&self, s: &state::Shared, current: usize) -> bool {
+        let list = self.list_now(s);
+        let (repeat, shuffle) = self.repeat_and_shuffle(s);
+        if repeat != Repeat::Off {
+            return false;
+        }
+        let songs = s.songs_of(&list, Some(current));
+        if shuffle {
+            self.deal_exhausted(&songs)
+        } else {
+            songs.last() == Some(&current)
+        }
+    }
+
+    /// The repeat and shuffle settings in force: a battle list has its own
+    /// shuffle switch and can hold its song for the whole fight; an area's
+    /// own list has its own shuffle switch too.
+    fn repeat_and_shuffle(&self, s: &state::Shared) -> (Repeat, bool) {
+        let battle_list = self.in_battle && s.config.battle_playlist.is_some();
+        let area_list =
+            self.area.filter(|&a| !self.in_battle && matches!(s.config.area_music(a), AreaMusic::List(_)));
+        let shuffle = match (battle_list, area_list) {
+            (true, _) => s.config.battle_shuffle,
+            (false, Some(a)) => s.config.area_shuffle(a),
+            (false, None) => s.config.shuffle,
+        };
+        let repeat = if battle_list && s.config.loop_battle_song { Repeat::One } else { s.config.repeat };
+        (repeat, shuffle)
     }
 
     /// This kind of place is left to the game's own music.
@@ -313,7 +360,7 @@ impl Player {
         self.map_new = None;
         let old = std::mem::replace(&mut self.map_id, id);
         log::info!("player: map {old} -> {id}");
-        let old_area = std::mem::replace(&mut self.area, Some(area));
+        let old_area = self.area.replace(area);
         let old_shrine = std::mem::replace(&mut self.shrine, shrine);
         let (on, playing, before, now) = {
             let mut s = state::lock();
@@ -488,12 +535,12 @@ impl Player {
             }
             self.run(c, game);
         }
-        if let Some((i, attempt, at)) = self.retry {
-            if Instant::now() >= at {
-                self.retry = None;
-                log::info!("player: retrying (attempt {})", attempt + 1);
-                self.start_attempt(i, 0.0, attempt, game);
-            }
+        if let Some((i, attempt, at)) = self.retry
+            && Instant::now() >= at
+        {
+            self.retry = None;
+            log::info!("player: retrying (attempt {})", attempt + 1);
+            self.start_attempt(i, 0.0, attempt, game);
         }
         self.resume_last(game);
         // Boss battles can keep the game's own music, as the developers
@@ -512,7 +559,17 @@ impl Player {
         // never a reason to skip ahead.
         let mut failed = None;
         let mut cut_off = None;
-        let loop_battle = self.in_battle && state::lock().config.loop_battle_song;
+        let (loop_battle, last) = {
+            let s = state::lock();
+            let current = self.now.as_ref().map(|(i, _)| *i);
+            (
+                self.in_battle && s.config.loop_battle_song,
+                current.is_some_and(|c| self.ends_playlist(&s, c)),
+            )
+        };
+        // The last song of a playlist (Repeat off) plays to its end: there is
+        // nothing to crossfade into, and the crossfade point would cut it.
+        let cf = if last { 0.0 } else { cf };
         let finished = match &mut self.now {
             Some((i, Playing::Cue { id, duration, paused: false, started, seen, reached, attempt, fades, fading })) => {
                 // A looping theme held for the whole fight just keeps looping
@@ -568,43 +625,26 @@ impl Player {
             _ => false,
         };
         // A cue that has really played clears any earlier failure.
-        if let Some((i, Playing::Cue { reached, .. })) = &self.now {
-            if *reached >= 1.0 && state::lock().is_unplayable(*i) {
-                state::lock().set_unplayable(*i, false);
-            }
+        if let Some((i, Playing::Cue { reached, .. })) = &self.now
+            && *reached >= 1.0
+            && state::lock().is_unplayable(*i)
+        {
+            state::lock().set_unplayable(*i, false);
         }
         if let Some((i, attempt)) = cut_off {
             // Keep showing the song as current while it waits.
             self.now = None;
             self.retry = Some((i, attempt, Instant::now() + CUE_RETRY_DELAY));
         } else if let Some(i) = failed {
-            let (title, checked) = {
-                let s = state::lock();
-                (s.tracks.get(i).map(|t| t.title.clone()).unwrap_or_default(), s.config.checked_build == s.config.game_build)
-            };
+            // A cue the game would not play: skipped for this session, never
+            // removed for good. A cue is cut off while a map loads, or held
+            // back in some places; only the song check, which plays every
+            // song in peace, decides what has no audio at all.
+            let title = state::lock().tracks.get(i).map(|t| t.title.clone()).unwrap_or_default();
             self.stop(game);
-            // Once every song has been checked on this game version, a song
-            // that fails now is only out of reach here (some places hold
-            // part of the soundtrack back), so it's skipped, not removed.
-            if checked {
-                log::warn!("player: the game would not play {title} here, skipping it");
-            } else {
-                log::error!("player: the game would not play {title}");
-                state::lock().set_unplayable(i, true);
-            }
-            if self.auto {
-                // Reached by Next, Shuffle or a playlist: go on to the song
-                // after it.
-                self.advance_from(game, false, Some(i));
-            } else {
-                let mut s = state::lock();
-                s.playing = false;
-                s.error = Some(if checked {
-                    format!("The game won't play {title} here. Try it again somewhere else.")
-                } else {
-                    format!("{title} has no audio in the game's files, so it was removed from the list.")
-                });
-            }
+            log::warn!("player: the game would not play {title} here, skipping it");
+            state::lock().set_skipped(i, true);
+            self.skip_on(game, i, format!("The game won't play {title} here. Try it again later."));
         } else if finished {
             self.advance(game, true);
         }
@@ -741,6 +781,16 @@ impl Player {
                 Some((i, Playing::Cue { .. })) => {
                     let i = *i;
                     self.start_at(i, t, game);
+                    // Seeking while paused or held restarts the cue at the
+                    // new place, but silent: it is paused straight away
+                    // rather than at the next tick.
+                    let quiet = {
+                        let s = state::lock();
+                        !s.playing || s.held
+                    };
+                    if quiet {
+                        self.set_paused(game, true);
+                    }
                 }
                 Some((_, Playing::File { sink, .. })) => {
                     let _ = sink.try_seek(Duration::from_secs_f32(t.max(0.0)));
@@ -781,11 +831,18 @@ impl Player {
                 s.tracks = files;
                 s.tracks.extend(game_tracks);
                 s.apply_titles();
+                // A file that would not play gets another try after a rescan;
+                // it may have been fixed or replaced.
+                s.skipped.retain(|k| !k.starts_with("file:"));
                 let moved = |i: usize| (i as isize + shift).max(0) as usize;
                 if let Some((i, _)) = &mut self.now {
                     *i = moved(*i);
                 }
                 if let Some((i, _, _)) = &mut self.retry {
+                    *i = moved(*i);
+                }
+                // The songs waiting to come back after a battle move too.
+                for (i, _) in [&mut self.battle_resume, &mut self.fight_resume].into_iter().flatten() {
                     *i = moved(*i);
                 }
             }
@@ -801,17 +858,7 @@ impl Player {
     fn advance_from(&mut self, game: &mut Game, natural_end: bool, current: Option<usize>) {
         let (list, repeat, shuffle) = {
             let s = state::lock();
-            // A battle list has its own shuffle switch, and can hold the
-            // song it started with for the whole fight; an area's own list
-            // has its own shuffle switch too.
-            let battle_list = self.in_battle && s.config.battle_playlist.is_some();
-            let area_list = self.area.filter(|&a| !self.in_battle && matches!(s.config.area_music(a), AreaMusic::List(_)));
-            let shuffle = match (battle_list, area_list) {
-                (true, _) => s.config.battle_shuffle,
-                (false, Some(a)) => s.config.area_shuffle(a),
-                (false, None) => s.config.shuffle,
-            };
-            let repeat = if battle_list && s.config.loop_battle_song { Repeat::One } else { s.config.repeat };
+            let (repeat, shuffle) = self.repeat_and_shuffle(&s);
             (s.songs_of(&self.list_now(&s), current), repeat, shuffle)
         };
         let len = list.len();
@@ -821,7 +868,9 @@ impl Player {
         // Where the current song sits in the playlist. A song played from
         // outside it continues from the playlist's start.
         let at = current.and_then(|c| list.iter().position(|&i| i == c));
-        let shuffled = if shuffle { self.draw(&list, current) } else { None };
+        // With Repeat off, Shuffle stops once every song has had its turn.
+        let deal_over = shuffle && natural_end && repeat == Repeat::Off && self.deal_exhausted(&list);
+        let shuffled = if shuffle && !deal_over { self.draw(&list, current) } else { None };
         let next = match (current, at, natural_end, repeat) {
             (Some(c), _, true, Repeat::One) => Some(c),
             _ if shuffle => shuffled,
@@ -844,6 +893,14 @@ impl Player {
         }
     }
 
+    /// The shuffle deal for `list` (on this side, battle or not) has been
+    /// dealt and every song drawn.
+    fn deal_exhausted(&self, list: &[usize]) -> bool {
+        let mut sorted = list.to_vec();
+        sorted.sort_unstable();
+        self.bags.get(&(self.in_battle, sorted)).is_some_and(|bag| bag.is_empty())
+    }
+
     /// Shuffle without repeats: every song of `list` once, in random order,
     /// before any comes round again. A new deal never opens with `current`.
     fn draw(&mut self, list: &[usize], current: Option<usize>) -> Option<usize> {
@@ -857,11 +914,11 @@ impl Player {
             *bag = list.to_vec();
             bag.shuffle(&mut rand::thread_rng());
             // Drawn from the end, so the current song goes to the front.
-            if let (Some(c), true) = (current, bag.len() > 1) {
-                if let Some(p) = bag.iter().position(|&i| i == c) {
-                    bag.remove(p);
-                    bag.insert(0, c);
-                }
+            if let (Some(c), true) = (current, bag.len() > 1)
+                && let Some(p) = bag.iter().position(|&i| i == c)
+            {
+                bag.remove(p);
+                bag.insert(0, c);
             }
         }
         bag.pop()
@@ -878,6 +935,12 @@ impl Player {
     }
 
     fn start_attempt(&mut self, i: usize, at: f32, attempt: u8, game: &mut Game) {
+        // Looked up before anything stops: a song that isn't there (an index
+        // from before a rescan) must not leave silence behind it.
+        let Some(track) = state::lock().tracks.get(i).cloned() else {
+            log::warn!("player: no song at {i} to start");
+            return;
+        };
         // A change of song crossfades; a seek or a retry starts cleanly.
         let cf = if std::mem::take(&mut self.crossfade_next) {
             state::lock().config.crossfade_secs.max(0.0)
@@ -886,7 +949,6 @@ impl Player {
         };
         self.retire(game, cf);
         self.fade_in = (cf > 0.0).then(|| (Instant::now(), cf));
-        let Some(track) = state::lock().tracks.get(i).cloned() else { return };
         let volume = if cf > 0.0 { 0.0 } else { self.ramped };
         let loop_secs = state::lock().config.loop_minutes * 60.0;
         let result = match &track.source {
@@ -928,9 +990,28 @@ impl Player {
                 self.volume = volume;
             }
             Err(e) => {
+                // A file that would not open or decode: skipped for this
+                // session (a rescan gives it another try), and on to the
+                // next song if a list picked it.
                 log::error!("player: {e}");
-                s.error = Some(e);
+                s.set_skipped(i, true);
+                drop(s);
+                self.skip_on(game, i, e);
             }
+        }
+    }
+
+    /// After song `i` would not play: on to the song after it if a list
+    /// picked it (Next, Shuffle, a playlist), else stop with `error` shown.
+    /// Each skipped song leaves the lists for the session, so a list of songs
+    /// that all fail ends rather than going round for ever.
+    fn skip_on(&mut self, game: &mut Game, i: usize, error: String) {
+        if self.auto {
+            self.advance_from(game, false, Some(i));
+        } else {
+            let mut s = state::lock();
+            s.playing = false;
+            s.error = Some(error);
         }
     }
 
@@ -1013,6 +1094,54 @@ mod tests {
         p.draw(&[1, 2, 3], None);
         let next = p.draw(&[8, 9], None).unwrap();
         assert!(next == 8 || next == 9);
+    }
+
+    fn three_songs() -> state::Shared {
+        let mut s = state::Shared::default();
+        s.config_path = std::env::temp_dir().join("ffrs_jukebox_player_test.toml");
+        s.tracks = (0..3).map(|i| state::Track::game(format!("BGM_PP_T{i}"), true)).collect();
+        s
+    }
+
+    #[test]
+    fn repeat_off_ends_with_the_last_song_or_the_last_of_the_deal() {
+        let mut s = three_songs();
+        s.config.repeat = Repeat::Off;
+        let mut p = Player::new();
+        assert!(!p.ends_playlist(&s, 1));
+        assert!(p.ends_playlist(&s, 2));
+        // Repeat on: the playlist never ends.
+        s.config.repeat = Repeat::All;
+        assert!(!p.ends_playlist(&s, 2));
+        // Shuffle: the deal ends once every song has been drawn.
+        s.config.repeat = Repeat::Off;
+        s.config.shuffle = true;
+        let songs = s.songs_of(&Playlist::AllSongs, None);
+        assert!(!p.ends_playlist(&s, 0), "nothing dealt yet");
+        let mut last = 0;
+        for _ in 0..songs.len() {
+            last = p.draw(&songs, None).unwrap();
+        }
+        assert!(p.ends_playlist(&s, last));
+    }
+
+    #[test]
+    fn an_empty_battle_or_area_list_falls_back_to_play_from() {
+        let mut s = three_songs();
+        s.create_playlist("Empty");
+        s.config.playlist = Playlist::Favorites;
+        s.config.battle_playlist = Some(Playlist::Custom("Empty".into()));
+        let mut p = Player::new();
+        p.in_battle = true;
+        assert_eq!(p.list_now(&s), Playlist::Favorites);
+        // With a song in it, the battle list is used.
+        s.toggle(state::List::Custom(0), 1);
+        assert_eq!(p.list_now(&s), Playlist::Custom("Empty".into()));
+        // The same for an area's list.
+        p.in_battle = false;
+        p.area = Some(Area::Town);
+        s.config.town_music = AreaMusic::List(Playlist::Folder("Nope".into()));
+        assert_eq!(p.list_now(&s), Playlist::Favorites);
     }
 
     #[test]

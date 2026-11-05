@@ -199,7 +199,16 @@ impl Menu {
     /// Only while the game is the active window, and not while a text box is
     /// being typed in.
     fn poll_keys(&mut self, typing: bool) {
-        let pressed = self.keys.pressed();
+        let pressed = {
+            let s = state::lock();
+            let bound = Bind::ALL.map(|b| s.config.key(b));
+            drop(s);
+            if self.capturing.is_some() {
+                self.keys.pressed(keys::ALL_KEYS)
+            } else {
+                self.keys.pressed(bound.into_iter())
+            }
+        };
         let focused = keys::game_focused();
         // The show-cursor key works by being held, not pressed.
         let hold = state::lock().config.key(Bind::ShowCursor);
@@ -220,14 +229,19 @@ impl Menu {
             state::lock().save_config();
         }
         // Controller combos: hold one button and press another. Read every
-        // frame, so a press only counts once.
+        // frame, so a press only counts once; not read at all while combos
+        // are off and the menu isn't being driven with the controller.
         keys::keep_xinput_filtered();
-        let (now, fresh) = self.pad.read();
-        self.pad_now = now;
         let (binds, on) = {
             let s = state::lock();
             (s.config.pad_binds(), s.config.controller)
         };
+        let (now, fresh) = if on || self.pad_nav || self.pad_capturing.is_some() {
+            self.pad.read()
+        } else {
+            self.pad.idle()
+        };
+        self.pad_now = now;
         self.pad_hold_down = on && now.held(binds.hold);
         self.pad_move = if self.pad_hold_down && focused { now.right_stick() } else { [0.0; 2] };
         if self.view != View::Full {
@@ -321,18 +335,18 @@ impl Menu {
                 let n = s.indices(List::Custom(p)).len();
                 let sub = song_count(n);
                 // Renaming happens in the card itself.
-                if let Some((rp, buf)) = &mut self.renaming_list {
-                    if *rp == p {
-                        match name_box(ui, &format!("##renamepl{p}"), buf, "Playlist name", &mut self.focus_name) {
-                            NameBox::Done => {
-                                actions.push(Action::Rename(p, buf.clone()));
-                                self.renaming_list = None;
-                            }
-                            NameBox::Cancelled => self.renaming_list = None,
-                            NameBox::Typing => {}
+                if let Some((rp, buf)) = &mut self.renaming_list
+                    && *rp == p
+                {
+                    match name_box(ui, &format!("##renamepl{p}"), buf, "Playlist name", &mut self.focus_name) {
+                        NameBox::Done => {
+                            actions.push(Action::Rename(p, buf.clone()));
+                            self.renaming_list = None;
                         }
-                        continue;
+                        NameBox::Cancelled => self.renaming_list = None,
+                        NameBox::Typing => {}
                     }
+                    continue;
                 }
                 let (open, button) =
                     card(ui, &format!("##pl{p}"), &pl.name, &sub, &[(theme::PLAY, "Play"), (theme::MORE, "More")]);
@@ -459,7 +473,7 @@ impl Menu {
             if songs.is_empty() {
                 ui.text_disabled("Empty. Use + on any song, or right-click it, to add it here.");
             }
-            for (n, &i) in songs.iter().enumerate() {
+            clipped(ui, &songs, |n, i| {
                 ui.align_text_to_frame_padding();
                 ui.text_disabled(format!("{:>2}", n + 1));
                 if let Some(list) = list {
@@ -473,7 +487,7 @@ impl Menu {
                 }
                 ui.same_line();
                 row(s, i, actions, list);
-            }
+            });
         });
     }
 
@@ -830,6 +844,21 @@ was when the battle started. Off: the next song plays instead.",
     }
 }
 
+/// Draws `draw(n, i)` for the rows of `rows` in view, and only those: a long
+/// list costs the same whatever its length. Rows must all be one height.
+fn clipped(ui: &Ui, rows: &[usize], mut draw: impl FnMut(usize, usize)) {
+    let mut clip = hudhook::imgui::ListClipper::new(rows.len() as i32).begin(ui);
+    while clip.step() {
+        for n in clip.display_start()..clip.display_end() {
+            let n = n as usize;
+            draw(n, rows[n]);
+        }
+    }
+}
+
+/// Which songs a tab shows.
+type Shows = fn(&state::Track) -> bool;
+
 fn song_count(n: usize) -> String {
     match n {
         0 => "Empty".into(),
@@ -1102,7 +1131,44 @@ impl ImguiRenderLoop for Menu {
         theme::apply(ctx, self.scale);
     }
 
+    // A panic on the render thread would unwind out of the game's Present
+    // call and take the game down with it. The game thread's tick already
+    // catches its own; so do these two, and the menu goes away for the frame.
     fn before_render<'a>(&'a mut self, ctx: &mut Context, _: &'a mut dyn RenderContext) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.prepare(ctx))).is_err() {
+            self.after_panic();
+        }
+    }
+
+    fn render(&mut self, ui: &mut Ui) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.draw(ui))).is_err() {
+            self.after_panic();
+        }
+    }
+
+    fn message_filter(&self, io: &Io) -> MessageFilter {
+        self.filter(io)
+    }
+}
+
+impl Menu {
+    /// Logs a panic in the menu and hides it, dropping anything half open,
+    /// so the next frame starts clean.
+    fn after_panic(&mut self) {
+        log::error!("menu: panicked, see the panic line above; the menu is hidden");
+        self.view = View::Hidden;
+        self.settings_open = false;
+        self.pad_nav = false;
+        self.open_list = None;
+        self.new_list = None;
+        self.renaming_list = None;
+        self.renaming = None;
+        self.confirm_delete = None;
+        self.capturing = None;
+        self.pad_capturing = None;
+    }
+
+    fn prepare(&mut self, ctx: &mut Context) {
         // The mini player stays up while exploring, where the game hides its
         // cursor, so one is drawn only while the mouse is over the player or
         // the show-cursor key (Left Alt) is held.
@@ -1155,7 +1221,7 @@ impl ImguiRenderLoop for Menu {
         }
     }
 
-    fn render(&mut self, ui: &mut Ui) {
+    fn draw(&mut self, ui: &mut Ui) {
         let key = state::lock().config.menu_key;
         // Typing in the jukebox's search box or in one of the game's own text
         // boxes (chat, names) must not also skip songs or change the volume.
@@ -1230,25 +1296,25 @@ impl ImguiRenderLoop for Menu {
                 return;
             }
             // Now-playing toast after a track change.
-            if let (Some(since), Some(title)) = (self.toast_since, &title) {
-                if since.elapsed().as_secs_f32() < TOAST_SECS {
-                    let [w, _] = ui.io().display_size;
-                    ui.window("##jukebox_toast")
-                        .position([w - 24.0, 24.0], Condition::Always)
-                        .position_pivot([1.0, 0.0])
-                        .flags(
-                            WindowFlags::NO_DECORATION
-                                | WindowFlags::NO_INPUTS
-                                | WindowFlags::ALWAYS_AUTO_RESIZE
-                                | WindowFlags::NO_FOCUS_ON_APPEARING
-                                | WindowFlags::NO_NAV,
-                        )
-                        .build(|| {
-                            theme::backdrop(ui);
-                            theme::shadow_text(ui, ACCENT, &format!("{} Now playing", theme::NOTE));
-                            theme::shadow_text(ui, theme::WHITE, title);
-                        });
-                }
+            if let (Some(since), Some(title)) = (self.toast_since, &title)
+                && since.elapsed().as_secs_f32() < TOAST_SECS
+            {
+                let [w, _] = ui.io().display_size;
+                ui.window("##jukebox_toast")
+                    .position([w - 24.0, 24.0], Condition::Always)
+                    .position_pivot([1.0, 0.0])
+                    .flags(
+                        WindowFlags::NO_DECORATION
+                            | WindowFlags::NO_INPUTS
+                            | WindowFlags::ALWAYS_AUTO_RESIZE
+                            | WindowFlags::NO_FOCUS_ON_APPEARING
+                            | WindowFlags::NO_NAV,
+                    )
+                    .build(|| {
+                        theme::backdrop(ui);
+                        theme::shadow_text(ui, ACCENT, &format!("{} Now playing", theme::NOTE));
+                        theme::shadow_text(ui, theme::WHITE, title);
+                    });
             }
             return;
         }
@@ -1634,11 +1700,12 @@ Until then, it follows the main Shuffle."
                 };
                 // A list in play order, with up/down buttons and, for your own
                 // playlists, a remove button.
+                let matches = |s: &state::Shared, i: usize| {
+                    needle.is_empty() || s.tracks[i].title.to_lowercase().contains(&needle)
+                };
                 let ordered = |s: &state::Shared, list: List, actions: &mut Vec<Action>| {
-                    for i in s.indices(list) {
-                        if !needle.is_empty() && !s.tracks[i].title.to_lowercase().contains(&needle) {
-                            continue;
-                        }
+                    let rows: Vec<usize> = s.indices(list).into_iter().filter(|&i| matches(s, i)).collect();
+                    clipped(ui, &rows, |_, i| {
                         if let List::Custom(_) = list {
                             if ui.small_button(format!("x##rm{i}")) {
                                 actions.push(Action::Toggle(list, i));
@@ -1649,7 +1716,7 @@ Until then, it follows the main Shuffle."
                             ui.same_line();
                         }
                         row(s, i, actions, Some(list));
-                    }
+                    });
                 };
                 let list_height = [0.0, -ui.frame_height_with_spacing()];
                 // Tab labels in the small font, so all six fit across.
@@ -1669,10 +1736,10 @@ Until then, it follows the main Shuffle."
                     if let Some(_tab) = tab("Playlists") {
                         // A playlist that was opened may since have been
                         // renamed or deleted, or its folder emptied.
-                        if let Some(open) = &self.open_list {
-                            if !s.play_from_choices().contains(open) {
-                                self.open_list = None;
-                            }
+                        if let Some(open) = &self.open_list
+                            && !s.play_from_choices().contains(open)
+                        {
+                            self.open_list = None;
                         }
                         match self.open_list.clone() {
                             None => self.playlist_cards(ui, &s, &mut actions, list_height),
@@ -1683,7 +1750,7 @@ Until then, it follows the main Shuffle."
                     }
                     // Game themes loop until stopped; the short pieces are
                     // the one-shot fanfares and stingers.
-                    let tabs: [(&str, fn(&state::Track) -> bool); 3] = [
+                    let tabs: [(&str, Shows); 3] = [
                         ("Themes", |t| t.is_game_loop()),
                         ("Jingles", |t| t.is_game() && !t.is_game_loop()),
                         ("My Music", |t| !t.is_game()),
@@ -1745,20 +1812,21 @@ Until then, it follows the main Shuffle."
                             }
                         }
                         ui.child_window("list").size(list_height).build(|| {
-                            for i in 0..s.tracks.len() {
-                                let t = &s.tracks[i];
-                                if !shows(t) || s.contains(List::Hidden, i) || s.is_unplayable(i) {
-                                    continue;
-                                }
-                                if !needle.is_empty() && !t.title.to_lowercase().contains(&needle) {
-                                    continue;
-                                }
-                                row(&s, i, &mut actions, None);
-                            }
+                            let rows: Vec<usize> = (0..s.tracks.len())
+                                .filter(|&i| {
+                                    shows(&s.tracks[i])
+                                        && !s.contains(List::Hidden, i)
+                                        && !s.is_unplayable(i)
+                                        && matches(&s, i)
+                                })
+                                .collect();
+                            clipped(ui, &rows, |_, i| row(&s, i, &mut actions, None));
                         });
                     }
                     if let Some(_tab) = tab("Hidden") {
-                        let hidden = s.indices(List::Hidden);
+                        // Songs that will not play are listed here too, so
+                        // they can still be unhidden.
+                        let hidden = s.indices_all(List::Hidden);
                         if hidden.is_empty() {
                             ui.text_disabled("Nothing hidden. Hide a song from its + menu or by right-clicking it.");
                         } else if ui.small_button("Unhide all") {
@@ -1767,16 +1835,14 @@ Until then, it follows the main Shuffle."
                         // Leaves a row under the list for the song check.
                         let short = [0.0, list_height[1] - ui.frame_height_with_spacing()];
                         ui.child_window("hidden").size(short).build(|| {
-                            for i in hidden {
-                                if !needle.is_empty() && !s.tracks[i].title.to_lowercase().contains(&needle) {
-                                    continue;
-                                }
+                            let rows: Vec<usize> = hidden.into_iter().filter(|&i| matches(&s, i)).collect();
+                            clipped(ui, &rows, |_, i| {
                                 if ui.small_button(format!("Unhide##uh{i}")) {
                                     actions.push(Action::Toggle(List::Hidden, i));
                                 }
                                 ui.same_line();
                                 row(&s, i, &mut actions, None);
-                            }
+                            });
                         });
                         // Rarely needed, so it lives here rather than over the
                         // song lists.
@@ -1826,13 +1892,20 @@ Until then, it follows the main Shuffle."
                         Action::RenameTrack(i, name) => s.rename_track(i, name.as_deref()),
                         Action::MoveTo(list, from, to) => s.move_to(list, from, to),
                         Action::PlayFrom(list, shuffle) => {
+                            // Starts a song of this list itself, whatever
+                            // list a battle or an area has in force.
                             s.config.playlist = list.clone();
                             config_changed = true;
-                            if shuffle {
+                            let songs = s.songs_of(&list, None);
+                            let pick = if shuffle {
+                                use rand::seq::SliceRandom;
                                 s.config.shuffle = true;
-                                s.push(Command::Next);
-                            } else if let Some(&first) = s.songs_of(&list, None).first() {
-                                s.push(Command::Play(first));
+                                songs.choose(&mut rand::thread_rng()).copied()
+                            } else {
+                                songs.first().copied()
+                            };
+                            if let Some(i) = pick {
+                                s.push(Command::Play(i));
                             }
                         }
                     }
@@ -1875,12 +1948,10 @@ Until then, it follows the main Shuffle."
             // inside the list under it.
             self.open_list = None;
             self.pad_swallow_b = true;
-        } else if back && !in_list.get() {
-            if self.pad_nav {
-                self.pad_nav = false;
-                self.view = self.view.next();
-                self.pad_swallow_b = true;
-            }
+        } else if back && !in_list.get() && self.pad_nav {
+            self.pad_nav = false;
+            self.view = self.view.next();
+            self.pad_swallow_b = true;
         }
         self.hovered = hovered_now.get();
         self.renaming = renaming.into_inner();
@@ -1900,13 +1971,15 @@ Until then, it follows the main Shuffle."
             self.settings(ui, &mut s, at);
         }
     }
+}
 
+impl Menu {
     /// The game keeps its input while the menu is open, so play goes on. The
     /// menu takes the mouse only while it is over the window, and the
     /// keyboard only while the search box is being typed in. The mini player
     /// takes only clicks on itself, never the raw mouse movement the camera
     /// uses, since the game's hidden cursor can rest over it while exploring.
-    fn message_filter(&self, io: &Io) -> MessageFilter {
+    fn filter(&self, io: &Io) -> MessageFilter {
         let mut filter = MessageFilter::empty();
         // A key being rebound must not also reach the game.
         if self.capturing.is_some() {

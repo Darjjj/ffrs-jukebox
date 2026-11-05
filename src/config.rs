@@ -576,10 +576,10 @@ impl Config {
     /// `bind` had, so no key ever does two things.
     pub fn set_key(&mut self, bind: Bind, vk: i32) {
         let old = self.key(bind);
-        if vk != 0 {
-            if let Some(other) = Bind::ALL.into_iter().find(|&b| b != bind && self.key(b) == vk) {
-                *self.key_mut(other) = old;
-            }
+        if vk != 0
+            && let Some(other) = Bind::ALL.into_iter().find(|&b| b != bind && self.key(b) == vk)
+        {
+            *self.key_mut(other) = old;
         }
         *self.key_mut(bind) = vk;
     }
@@ -621,6 +621,32 @@ impl Config {
                 config.save(path);
                 config
             }
+        }
+    }
+
+    /// Hands a copy to the writer thread, which writes it after a short
+    /// pause; copies that arrive meanwhile replace it, so a burst of changes
+    /// (a slider drag, the position saved every few seconds) is one write.
+    /// Neither the menu nor the player waits on the disk this way.
+    pub fn save_in_background(&self, path: &Path) {
+        use std::sync::mpsc::{Sender, channel};
+        static WRITER: std::sync::OnceLock<Sender<(PathBuf, Config)>> = std::sync::OnceLock::new();
+        let tx = WRITER.get_or_init(|| {
+            let (tx, rx) = channel::<(PathBuf, Config)>();
+            std::thread::spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    let mut latest = first;
+                    while let Ok(next) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                        latest = next;
+                    }
+                    latest.1.save(&latest.0);
+                }
+            });
+            tx
+        });
+        if tx.send((path.to_path_buf(), self.clone())).is_err() {
+            // The writer thread is gone; write here rather than lose it.
+            self.save(path);
         }
     }
 

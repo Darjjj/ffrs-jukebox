@@ -198,15 +198,15 @@ pub fn pretty(cue: &str) -> String {
     }
 
     // "LA01_005" is a scene code; keep it as one readable code, "LA01-005".
-    if let Some(p) = tokens.iter().position(|t| t.len() == 4 && t.starts_with("LA")) {
-        if let Some(next) = tokens.get(p + 1).filter(|n| n.chars().all(|c| c.is_ascii_digit())) {
-            let code = format!("{}-{next}", tokens[p]);
-            let mut words: Vec<String> = tokens[..p].iter().map(|t| word(t)).collect();
-            words.push(code);
-            words.extend(tokens[p + 2..].iter().map(|t| word(t)));
-            let body = join(&words);
-            return if prefix.is_empty() { body } else { format!("{prefix} {body}") };
-        }
+    if let Some(p) = tokens.iter().position(|t| t.len() == 4 && t.starts_with("LA"))
+        && let Some(next) = tokens.get(p + 1).filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+    {
+        let code = format!("{}-{next}", tokens[p]);
+        let mut words: Vec<String> = tokens[..p].iter().map(|t| word(t)).collect();
+        words.push(code);
+        words.extend(tokens[p + 2..].iter().map(|t| word(t)));
+        let body = join(&words);
+        return if prefix.is_empty() { body } else { format!("{prefix} {body}") };
     }
 
     let words: Vec<String> = tokens.iter().map(|t| word(t)).collect();

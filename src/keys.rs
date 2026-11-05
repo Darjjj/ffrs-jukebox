@@ -74,10 +74,15 @@ impl KeyPoll {
         Self { down: [false; 256] }
     }
 
-    /// The keys pressed since the last call, in key-code order.
-    pub fn pressed(&mut self) -> Vec<i32> {
+    /// The keys among `watch` pressed since the last call, in the order
+    /// given. Only the bound keys are asked about each frame; every key
+    /// (see [`ALL_KEYS`]) only while one is being rebound.
+    pub fn pressed(&mut self, watch: impl Iterator<Item = i32>) -> Vec<i32> {
         let mut fresh = Vec::new();
-        for vk in 0..256i32 {
+        for vk in watch {
+            if !(0..256).contains(&vk) {
+                continue;
+            }
             let now = unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000 != 0;
             if now && !self.down[vk as usize] && bindable(vk) {
                 fresh.push(vk);
@@ -87,6 +92,9 @@ impl KeyPoll {
         fresh
     }
 }
+
+/// Every key that may be bound, for the rebinding capture.
+pub const ALL_KEYS: std::ops::Range<i32> = 0x08..0xFF;
 
 /// A controller button, as the combos and the settings name it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -180,9 +188,12 @@ const STICK_LEAN: i16 = 16000;
 /// How much of the right stick's travel is ignored, so a resting stick
 /// doesn't drift the jukebox.
 const STICK_DEAD: f32 = 0.25;
-/// An empty controller slot is slow to ask about, so one is only asked
-/// again this often.
+/// An empty controller slot is slow to ask about (milliseconds, not
+/// microseconds), so one is only asked again this often, and the four slots
+/// are asked on different frames, [`SLOT_STAGGER`] apart, rather than all
+/// in one.
 const EMPTY_SLOT_RETRY: Duration = Duration::from_secs(2);
+const SLOT_STAGGER: Duration = Duration::from_millis(500);
 
 /// Every connected controller's buttons together, as one.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -270,16 +281,16 @@ unsafe extern "system" fn get_state_filter(slot: u32, state: *mut XINPUT_STATE) 
     IN_FILTER.set(true);
     let result = unsafe { std::mem::transmute::<usize, GetState>(next)(slot, state) };
     IN_FILTER.set(false);
-    if result == 0 {
-        if let Some(s) = unsafe { state.as_mut() } {
-            if HIDE_ALL.load(Ordering::Relaxed) {
-                s.Gamepad = Default::default();
-            } else {
-                s.Gamepad.wButtons.0 &= !HIDE_BUTTONS.load(Ordering::Relaxed);
-                if HIDE_RIGHT_STICK.load(Ordering::Relaxed) {
-                    s.Gamepad.sThumbRX = 0;
-                    s.Gamepad.sThumbRY = 0;
-                }
+    if result == 0
+        && let Some(s) = unsafe { state.as_mut() }
+    {
+        if HIDE_ALL.load(Ordering::Relaxed) {
+            s.Gamepad = Default::default();
+        } else {
+            s.Gamepad.wButtons.0 &= !HIDE_BUTTONS.load(Ordering::Relaxed);
+            if HIDE_RIGHT_STICK.load(Ordering::Relaxed) {
+                s.Gamepad.sThumbRX = 0;
+                s.Gamepad.sThumbRY = 0;
             }
         }
     }
@@ -458,12 +469,19 @@ impl PadPoll {
                     now.ly = g.sThumbLY;
                 }
             } else {
-                self.retry[i] = Some(Instant::now() + EMPTY_SLOT_RETRY);
+                self.retry[i] = Some(Instant::now() + EMPTY_SLOT_RETRY + SLOT_STAGGER * slot);
             }
         }
         let fresh = PadButton::ALL.into_iter().filter(|&b| now.held(b) && !self.last.held(b)).collect();
         self.last = now;
         (now, fresh)
+    }
+
+    /// Nothing read this frame (the controller isn't in use): reports every
+    /// button as up, so nothing counts as freshly pressed later.
+    pub fn idle(&mut self) -> (PadState, Vec<PadButton>) {
+        self.last = PadState::default();
+        (PadState::default(), Vec::new())
     }
 }
 

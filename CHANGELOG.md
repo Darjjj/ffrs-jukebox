@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.7.0 - 2026-11-05
+
+- Performance: settings are saved on a thread of their own instead of the game thread, controller
+  slots are checked across frames instead of all at once (a small hitch every two seconds for
+  keyboard-only players is gone), only the bound keys are polled, long song lists draw only the rows
+  in view, and the audio output is opened at start-up.
+- A song that won't play no longer stops the jukebox or disappears from your lists; it's skipped
+  for the session. Apple Lossless (.m4a) files play now.
+- Repeat and Shuffle behave better at the end of a list.
+- Various smaller fixes and sturdier handling of faults.
+
 ## 1.6.2 - 2026-11-02
 
 - No gameplay changes: the jukebox is the same as 1.6.1; only the download is packaged differently.

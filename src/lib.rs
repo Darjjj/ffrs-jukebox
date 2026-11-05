@@ -63,6 +63,9 @@ fn init_logging(path: &std::path::Path) {
         })
         .level(log::LevelFilter::Debug)
         .level_for("hudhook", log::LevelFilter::Warn)
+        // The decoder narrates every byte it skips in a damaged file; the
+        // jukebox's own "could not decode" line says all that's needed.
+        .filter(|meta| !meta.target().starts_with("symphonia") || meta.level() <= log::Level::Error)
         .chain(file)
         .apply();
 }
@@ -85,13 +88,13 @@ fn main(this_module: HMODULE) {
 
     let config_path = dir.join("ffrs_jukebox.toml");
     let mut config = config::Config::load(&config_path);
-    // Songs found to have no audio get another try once the game updates.
+    // On a fresh install or a game update, the songs with no audio start
+    // out as the known ones; the song check then goes over every song on
+    // this build and corrects the list.
     let build = game_build();
     if config.game_build != build {
-        if !config.unplayable.is_empty() {
-            log::info!("main: game updated, retrying {} songs that had no audio", config.unplayable.len());
-            config.unplayable.clear();
-        }
+        log::info!("main: new game build, starting from the {} songs known to have no audio", state::KNOWN_SILENT.len());
+        config.unplayable = state::KNOWN_SILENT.iter().map(|cue| format!("game:{cue}")).collect();
         config.game_build = build;
         config.save(&config_path);
     }
@@ -100,6 +103,9 @@ fn main(this_module: HMODULE) {
     log::info!("main: {} files in {}", tracks.len(), music_dir.display());
     state::init(state::Shared { config, config_path, music_dir, tracks, ..Default::default() });
     state::lock().apply_titles();
+    // Opening the audio output takes a moment; done here rather than on the
+    // game thread when the first file plays.
+    player::warm_up();
 
     // Game-thread entry for the player: inside UObject::ProcessEvent, not at its
     // entry. The ultrawide fix finds ProcessEvent by its first 0x55 bytes, so a
@@ -120,7 +126,12 @@ fn main(this_module: HMODULE) {
         entry
     };
     match MidHook::install(process_event, |_ctx| game::on_process_event()) {
-        Ok(_) => log::info!("main: ProcessEvent hooked @ {process_event:p}"),
+        Ok(hook) => {
+            // The hook stays for the life of the game, whatever a future
+            // grapnel does on drop.
+            std::mem::forget(hook);
+            log::info!("main: ProcessEvent hooked @ {process_event:p}");
+        }
         Err(e) => {
             log::error!("main: could not hook ProcessEvent: {e}");
             return;

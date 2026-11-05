@@ -292,7 +292,7 @@ impl Game {
         // A movie inside a battle (a Vision attack) plays over the game's
         // battle music, so it stays part of the battle and the song carries on.
         if movie && !battle {
-            crate::log_change("signals", "game: movie with its own audio".into());
+            crate::log_change("movie", "game: movie with its own audio".into());
             return Scene::Movie;
         }
         crate::log_change("movie", format!("game: movie in battle={movie}"));
@@ -518,10 +518,10 @@ impl Game {
     pub fn current_bgm_cue(&mut self) -> Option<String> {
         let id = self.current_bgm()?;
         let mut cached = BGM_CUE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((known, name)) = cached.as_ref() {
-            if *known == id {
-                return Some(name.clone());
-            }
+        if let Some((known, name)) = cached.as_ref()
+            && *known == id
+        {
+            return Some(name.clone());
         }
         let sound = *self.sm()?.m_PlaySoundList.get(&id)?;
         let atom = unsafe { sound.as_mut()?.m_AtomComponent.as_mut()? };
@@ -558,11 +558,11 @@ impl BgmMute {
         if Some(id) == own {
             return;
         }
-        if !self.muted.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.muted.entry(id) {
             let v = game.volume(id);
             // A track caught during its fade-in reads near silent; restoring
             // that would leave the game's music quiet.
-            self.muted.insert(id, if v < 0.3 { 1.0 } else { v });
+            slot.insert(if v < 0.3 { 1.0 } else { v });
             log::info!("game: muting game BGM id {id} (was {v:.2})");
         }
         game.set_volume(id, 0.0);

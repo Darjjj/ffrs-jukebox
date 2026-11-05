@@ -2,11 +2,34 @@
 //! The menu only reads it and queues [`Command`]s; the player is the only side
 //! that touches audio or the game.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::config::{Config, CustomPlaylist, Playlist, Scene};
+
+/// Game songs known to have no audio in the game's files (16 of the 212
+/// named cues, as of the 1.0 release). They seed `config.unplayable` on a
+/// fresh install or a game update, so no one has to wait for the song check
+/// to find them; the check still runs and corrects the list either way.
+pub const KNOWN_SILENT: [&str; 16] = [
+    "BGM_LD_FF02_MAIN_THEME_FFPR",
+    "BGM_LD_FF02_THE_REBEL_ARMY_FFPR",
+    "BGM_LD_FF03_ETERNAL_WIND_FFPR",
+    "BGM_LD_FF04_MAIN_THEME_FFPR",
+    "BGM_LD_FF04_MAIN_THEME_SFC",
+    "BGM_LD_FF04_THEME_OF_LOVE_FFPR",
+    "BGM_LD_FF04_THEME_OF_LOVE_SFC",
+    "BGM_LD_FF07_SECTOR_7_SLUMS",
+    "BGM_LD_FF08_THE_OATH",
+    "BGM_LD_FF09_SWORDS_OF_FURY",
+    "BGM_LD_FF09_FESTIVAL_OF_THE_HUNT",
+    "BGM_LD_FF09_NOT_ALONE",
+    "BGM_LD_FF12_THE_DALMASCA_ESTERSAND",
+    "BGM_LD_FF14_TOMORROW_AND_TOMORROW",
+    "BGM_LD_FF14_THE_DARK_WHICH_ILLUMINATES_THE_WORLD",
+    "BGM_LD_FF14_TOMORROW_AND_TOMORROW_REPRISE",
+];
 
 #[derive(Clone, Debug)]
 pub enum Source {
@@ -73,6 +96,11 @@ pub struct Shared {
     /// once the game has loaded its BGM cue sheet.
     pub game_tracks_ready: bool,
     pub commands: VecDeque<Command>,
+    /// Songs that would not play this session (a cue the game cut off, a
+    /// file that would not decode), by track key: skipped like unplayable
+    /// ones, but never written to the config. Only the song check decides
+    /// what is unplayable for good. Files are tried again on a rescan.
+    pub skipped: HashSet<String>,
 
     // Written by the player, shown by the menu.
     pub current: Option<usize>,
@@ -103,8 +131,10 @@ impl Shared {
         self.commands.push_back(command);
     }
 
+    /// Queues the config for writing on the writer thread: the menu and the
+    /// player call this often, and neither should wait on the disk.
     pub fn save_config(&self) {
-        self.config.save(&self.config_path);
+        self.config.save_in_background(&self.config_path);
     }
 
     fn keys(&self, list: List) -> &[String] {
@@ -160,11 +190,13 @@ impl Shared {
     /// missing (a deleted file, game songs not listed yet, or a game song
     /// with no audio) is skipped.
     pub fn indices(&self, list: List) -> Vec<usize> {
-        self.keys(list)
-            .iter()
-            .filter_map(|k| self.tracks.iter().position(|t| t.key == *k))
-            .filter(|&i| !self.is_unplayable(i))
-            .collect()
+        self.indices_all(list).into_iter().filter(|&i| !self.is_unplayable(i)).collect()
+    }
+
+    /// [`indices`](Self::indices), keeping songs that will not play too:
+    /// the Hidden tab lists those as well, so they can still be unhidden.
+    pub fn indices_all(&self, list: List) -> Vec<usize> {
+        self.keys(list).iter().filter_map(|k| self.tracks.iter().position(|t| t.key == *k)).collect()
     }
 
     pub fn find_playlist(&self, name: &str) -> Option<usize> {
@@ -316,39 +348,61 @@ impl Shared {
     /// The songs of `which`, as [`playlist_keeping`](Self::playlist_keeping)
     /// gives them for "Play from"; also used for the battle music.
     pub fn songs_of(&self, which: &Playlist, keep: Option<usize>) -> Vec<usize> {
-        let playable = |i: &usize| Some(*i) == keep || !self.is_unplayable(*i);
-        let chosen: Option<Vec<usize>> = match which {
-            Playlist::AllSongs => None,
-            Playlist::Favorites => Some(self.indices(List::Favorites)),
-            Playlist::Custom(name) => self.find_playlist(name).map(|p| self.indices(List::Custom(p))),
-            Playlist::Folder(name) => {
-                let prefix = format!("file:{name}/");
-                Some((0..self.tracks.len()).filter(|&i| self.tracks[i].key.starts_with(&prefix)).collect())
-            }
-        };
-        if let Some(songs) =
-            chosen.map(|s| s.into_iter().filter(playable).collect::<Vec<_>>()).filter(|s| !s.is_empty())
-        {
+        if let Some(songs) = self.songs_of_only(which, keep) {
             return songs;
         }
         // Hidden songs stay out of "All songs", but a song you put in a
         // playlist yourself plays from it either way.
+        let playable = |i: &usize| Some(*i) == keep || !self.is_unplayable(*i);
         let all = (0..self.tracks.len()).filter(playable);
         let shown: Vec<usize> = all.clone().filter(|&i| !self.contains(List::Hidden, i)).collect();
         if shown.is_empty() { all.collect() } else { shown }
     }
 
+    /// The playable songs of `which` itself: `None` for "All songs", and for
+    /// a list with nothing playable in it, so a battle or area list that has
+    /// run empty can fall back to "Play from" rather than to every song.
+    pub fn songs_of_only(&self, which: &Playlist, keep: Option<usize>) -> Option<Vec<usize>> {
+        let playable = |i: &usize| Some(*i) == keep || !self.is_unplayable(*i);
+        let chosen: Vec<usize> = match which {
+            Playlist::AllSongs => return None,
+            Playlist::Favorites => self.indices(List::Favorites),
+            Playlist::Custom(name) => self.indices(List::Custom(self.find_playlist(name)?)),
+            Playlist::Folder(name) => {
+                let prefix = format!("file:{name}/");
+                (0..self.tracks.len()).filter(|&i| self.tracks[i].key.starts_with(&prefix)).collect()
+            }
+        };
+        let songs: Vec<usize> = chosen.into_iter().filter(playable).collect();
+        (!songs.is_empty()).then_some(songs)
+    }
+
     pub fn is_unplayable_key(&self, key: &str) -> bool {
-        self.config.unplayable.iter().any(|k| k == key)
+        self.config.unplayable.iter().any(|k| k == key) || self.skipped.contains(key)
     }
 
     pub fn is_unplayable(&self, i: usize) -> bool {
-        self.tracks.get(i).is_some_and(|t| self.config.unplayable.contains(&t.key))
+        self.tracks.get(i).is_some_and(|t| self.is_unplayable_key(&t.key))
     }
 
-    /// Records whether song `i` played, saving only on a change.
+    /// Skips song `i` for the rest of the session (it would not play), or
+    /// lets it play again. Nothing is written to the config.
+    pub fn set_skipped(&mut self, i: usize, skipped: bool) {
+        let Some(key) = self.tracks.get(i).map(|t| t.key.clone()) else { return };
+        if skipped {
+            self.skipped.insert(key);
+        } else {
+            self.skipped.remove(&key);
+        }
+    }
+
+    /// Records whether song `i` has audio, as the song check found; saved
+    /// only on a change. A song found playing is no longer skipped either.
     pub fn set_unplayable(&mut self, i: usize, unplayable: bool) {
         let Some(key) = self.tracks.get(i).map(|t| t.key.clone()) else { return };
+        if !unplayable {
+            self.skipped.remove(&key);
+        }
         let known = self.config.unplayable.iter().position(|k| *k == key);
         match (known, unplayable) {
             (None, true) => self.config.unplayable.push(key),
@@ -386,7 +440,9 @@ pub fn lock() -> MutexGuard<'static, Shared> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-const EXTENSIONS: [&str; 7] = ["mp3", "ogg", "flac", "wav", "m4a", "aac", "opus"];
+/// What the decoder can play: no Opus (rodio has no decoder for it), so an
+/// .opus file is left out rather than listed and then failing.
+const EXTENSIONS: [&str; 6] = ["mp3", "ogg", "flac", "wav", "m4a", "aac"];
 
 /// Every playable file under `dir`, sorted by path, titled by its path
 /// relative to `dir` without the extension.
@@ -486,6 +542,26 @@ mod tests {
         s.rename_track(5, None);
         assert_eq!(s.tracks[5].title, "Rock/c.mp3");
         assert_eq!(s.config.titles.get("BGM_PP_T0").map(String::as_str), Some("Opening"));
+    }
+
+    #[test]
+    fn a_skipped_song_leaves_the_lists_for_the_session_only() {
+        let mut s = shared();
+        s.toggle(List::Favorites, 1);
+        s.set_skipped(1, true);
+        assert!(s.is_unplayable(1));
+        assert_eq!(s.indices(List::Favorites), Vec::<usize>::new());
+        assert!(s.config.unplayable.is_empty(), "skipping must not touch the config");
+        // The check finding it playing clears the skip.
+        s.set_unplayable(1, false);
+        assert!(!s.is_unplayable(1));
+        // A list that has nothing playable is empty, not everything.
+        s.set_skipped(1, true);
+        assert_eq!(s.songs_of_only(&Playlist::Favorites, None), None);
+        assert_eq!(s.songs_of(&Playlist::Favorites, None), vec![0, 2]);
+        // The Hidden tab still lists a skipped song, so it can be unhidden.
+        s.toggle(List::Hidden, 1);
+        assert_eq!(s.indices_all(List::Hidden), vec![1]);
     }
 
     #[test]
