@@ -31,6 +31,7 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
 - **Keeps playing while you talk.** Townsfolk, shops, the inn, bulletin boards and save points don't interrupt your
   music; only story scenes count as cutscenes.
 - **Favorites, playlists, hide and rename** any song, from a right-click menu.
+- **Play next** lines up one song to play after the current one, without losing your place in the list.
 - **Shuffle without repeats** (battle music has a Shuffle of its own), a one-click **repeat** button (off, playlist, song), **crossfade** between songs, and **resume** the last
   song where you left it when the game starts.
 - **Mini player** for while you explore, with volume on the mouse wheel. It can hide itself during
@@ -93,7 +94,7 @@ active window.
 - **Right-click any song** to add it to a playlist, rename it or hide it. Hidden songs can be brought back
   from the Hidden tab.
 - **Play from** picks the list Next and Shuffle draw from; **Music for** picks a separate one for battles,
-  the field, towns or dungeons.
+  the field, towns or dungeons. **Game themes** is the game's full-length songs without its short jingles.
 - **Controller with extra buttons?** Back paddles, grip buttons and the like (Xbox Elite, DualSense Edge,
   Steam Deck, Steam Controller) can do it in one tap: with Steam Input on for the game (right-click it in
   your Steam library > Properties > Controller), bind a spare button to a jukebox key in the controller

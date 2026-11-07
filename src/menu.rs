@@ -39,6 +39,8 @@ enum Action {
     /// Drag and drop: song `.1` moves to where song `.2` is in the list.
     MoveTo(List, usize, usize),
     UnhideAll,
+    /// Line this song up to play next, or take it off with `None`.
+    PlayNext(Option<usize>),
     /// A song's new name, or `None` for its default one back.
     RenameTrack(usize, Option<String>),
 }
@@ -403,16 +405,14 @@ impl Menu {
             if !folders.is_empty() {
                 ui.spacing();
                 ui.text_disabled("Folders in your music folder");
-                for name in folders {
-                    let prefix = format!("file:{name}/");
-                    let n = s.tracks.iter().filter(|t| t.key.starts_with(&prefix)).count();
+                for (name, n) in folders {
                     let (open, button) =
-                        card(ui, &format!("##folder{name}"), &name, &format!("Folder - {}", song_count(n)), &[(theme::PLAY, "Play")]);
+                        card(ui, &format!("##folder{name}"), name, &format!("Folder - {}", song_count(*n)), &[(theme::PLAY, "Play")]);
                     if open {
                         self.open_list = Some(Playlist::Folder(name.clone()));
                     }
                     if button == Some(0) {
-                        actions.push(Action::PlayFrom(Playlist::Folder(name), false));
+                        actions.push(Action::PlayFrom(Playlist::Folder(name.clone()), false));
                     }
                 }
             }
@@ -1415,6 +1415,49 @@ impl Menu {
                     scene.to_string()
                 };
                 ui.text_disabled(status);
+                // The game's own song last heard, with its star, so a theme
+                // that caught your ear can be kept after the moment passes.
+                if let Some(i) = s.heard.clone().and_then(|k| s.index_of(&k)) {
+                    let fav = s.contains(List::Favorites, i);
+                    ui.align_text_to_frame_padding();
+                    ui.text_disabled(format!("Heard in game: {}", s.tracks[i].title));
+                    ui.same_line();
+                    let clicked = {
+                        let _text = ui.push_style_color(StyleColor::Text, if fav { ACCENT } else { DIM });
+                        let _bg = ui.push_style_color(StyleColor::Button, [0.0; 4]);
+                        let _edge = ui.push_style_color(StyleColor::Border, [0.0; 4]);
+                        let star = if fav { theme::STAR } else { theme::STAR_EMPTY };
+                        ui.small_button(format!("{star}##heard"))
+                    };
+                    if clicked {
+                        s.toggle(List::Favorites, i);
+                    }
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(if fav {
+                            "In your Favorites. Click to take it out."
+                        } else {
+                            "The game's own song you heard last. Click to add it to Favorites."
+                        });
+                    }
+                }
+                // The song lined up with Play next, with a way to take it off.
+                if let Some(i) = s.up_next.clone().and_then(|k| s.index_of(&k)) {
+                    ui.align_text_to_frame_padding();
+                    ui.text_disabled(format!("Up next: {}", s.tracks[i].title));
+                    ui.same_line();
+                    let clicked = {
+                        let _text = ui.push_style_color(StyleColor::Text, DIM);
+                        let _bg = ui.push_style_color(StyleColor::Button, [0.0; 4]);
+                        let _edge = ui.push_style_color(StyleColor::Border, [0.0; 4]);
+                        ui.small_button("x##upnext")
+                    };
+                    if clicked {
+                        s.up_next = None;
+                    }
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text("Don't play it next");
+                    }
+                }
                 progress(ui, &mut s);
                 let b = transport(ui, &mut s, song_font, [ui.frame_height() * 1.8, ui.frame_height() * 1.35]);
                 ui.same_line();
@@ -1602,10 +1645,19 @@ Until then, it follows the main Shuffle."
                         }
                     }
                     if ui.is_item_hovered() {
-                        ui.tooltip_text("Add to a playlist, or hide (also on right-click)");
+                        ui.tooltip_text("Play next, add to a playlist, or hide (also on right-click)");
                     }
                     ui.popup(&popup, || {
                         let _hover = ui.push_style_color(StyleColor::HeaderHovered, [0.45, 0.8, 0.95, 0.35]);
+                        let lined_up = s.up_next.as_deref() == Some(s.tracks[i].key.as_str());
+                        if lined_up {
+                            if ui.selectable("Don't play next") {
+                                actions.push(Action::PlayNext(None));
+                            }
+                        } else if ui.selectable("Play next") {
+                            actions.push(Action::PlayNext(Some(i)));
+                        }
+                        ui.separator();
                         ui.text_disabled("Add to playlist");
                         for (p, pl) in s.config.playlists.iter().enumerate() {
                             let mut inside = s.contains(List::Custom(p), i);
@@ -1868,7 +1920,8 @@ Until then, it follows the main Shuffle."
                 }
                 for action in actions {
                     match action {
-                        Action::Play(i) => s.push(Command::Play(i)),
+                        Action::Play(i) => s.play(i),
+                        Action::PlayNext(i) => s.up_next = i.and_then(|i| s.tracks.get(i)).map(|t| t.key.clone()),
                         Action::Toggle(list, i) => s.toggle(list, i),
                         Action::Create(song) => {
                             let p = s.create_playlist("New playlist");
@@ -1905,7 +1958,7 @@ Until then, it follows the main Shuffle."
                                 songs.first().copied()
                             };
                             if let Some(i) = pick {
-                                s.push(Command::Play(i));
+                                s.play(i);
                             }
                         }
                     }

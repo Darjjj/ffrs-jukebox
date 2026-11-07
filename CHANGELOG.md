@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.7.1 - 2026-11-06
+
+- Your own songs now pick up where they left off after a battle and when the game starts, like the
+  game's songs already did.
+- New: the full menu shows the game's own song you heard last, with a star to add it to Favorites.
+- New: "Play next" on a song's + menu lines it up to play after the current song, then your list
+  carries on where it was. It waits out a battle, and the full menu shows it with a way to take it off.
+- New: "Game themes" under Play from and Music for plays the game's full-length songs, leaving out
+  its short jingles and stingers.
+- "All songs" chosen under Music for is honored instead of falling back to "Play from".
+- Pausing sticks: a battle ending, a retry or a seek no longer starts a paused song again.
+- Rescanning the music folder happens in the background and keeps every song straight, even when
+  files are added or removed mid-battle or while the song check runs.
+- With no sound device at start-up, your own music comes back once one is connected, instead of
+  needing a restart; songs are no longer skipped as broken because of it.
+- Your own music stops the moment the game window closes, instead of playing on for a second.
+- Lighter background work on the game thread while a save loads and while a song plays.
+- Your own songs open, and jump to where they left off, in the background, so starting one no
+  longer costs the game a frame. The full menu does less work while it's open, and the jukebox's
+  start-up search for the game's sound system is spread out instead of done in one go.
+- A big music folder no longer delays the overlay at start-up, which could bring back the start-up
+  buzz.
+- After a game update the jukebox switches itself off and says so in the menu, instead of risking a
+  crash.
+- Clicking a song while the music folder is being rescanned plays that song, not its neighbour.
+- Short songs play properly with a long crossfade, and a paused song stays paused near its end.
+- Pausing, or a cutscene starting, also silences a song that was still fading out.
+- The song check no longer marks a game song as having no audio when the game just wouldn't start
+  it during a load.
+- A trigger bound to a jukebox action no longer reaches the game too.
+- A settings file saved in another encoding is kept aside as `ffrs_jukebox.toml.bad` instead of
+  being lost.
+
 ## 1.7.0 - 2026-11-05
 
 - Performance: settings are saved on a thread of their own instead of the game thread, controller

@@ -4,7 +4,8 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source as _};
@@ -13,31 +14,81 @@ use crate::check::SongCheck;
 use crate::loudness;
 use crate::config::{Area, AreaMusic, Playlist, Repeat};
 use crate::game::{BgmMute, Game, refresh_game_tracks};
-use crate::state::{self, Command, Source};
+use crate::state::{self, Command, Source, Track};
 
-/// The output stream must stay on the thread that opened it, so it is opened
-/// on a thread of its own that keeps it alive for the life of the process.
-fn output() -> Option<&'static OutputStreamHandle> {
-    static HANDLE: OnceLock<Option<OutputStreamHandle>> = OnceLock::new();
-    HANDLE
-        .get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || match OutputStream::try_default() {
-                Ok((stream, handle)) => {
-                    let _ = tx.send(Some(handle));
-                    let _stream = stream;
-                    loop {
-                        std::thread::park();
-                    }
-                }
-                Err(e) => {
-                    log::error!("player: no audio output: {e}");
-                    let _ = tx.send(None);
-                }
-            });
-            rx.recv().ok().flatten()
-        })
-        .as_ref()
+/// How long after the audio output failed to open it is tried again: a
+/// player who plugs in headphones (or whose device was busy) gets their own
+/// music back without restarting the game.
+const OUTPUT_RETRY: Duration = Duration::from_secs(3);
+
+/// The audio output for your own files. The stream must stay on the thread
+/// that opened it, so it is opened on a thread of its own that keeps it alive
+/// for the life of the process. A failure is not kept for good: the next file
+/// to play after [`OUTPUT_RETRY`] tries again.
+static OUTPUT: Mutex<(Option<OutputStreamHandle>, Option<Instant>)> = Mutex::new((None, None));
+/// The game's window is gone: no output is opened until it comes back.
+static CLOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn output() -> Option<OutputStreamHandle> {
+    if CLOSING.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let mut out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = &out.0 {
+        return Some(handle.clone());
+    }
+    if out.1.is_some_and(|failed| failed.elapsed() < OUTPUT_RETRY) {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || match OutputStream::try_default() {
+        Ok((stream, handle)) => {
+            let _ = tx.send(Some(handle));
+            // Kept until the game closes (see `silence_for_exit`): dropping
+            // the stream silences every file at once.
+            let _ = stop_rx.recv();
+            drop(stream);
+        }
+        Err(e) => {
+            log::error!("player: no audio output: {e}");
+            let _ = tx.send(None);
+        }
+    });
+    let handle = rx.recv().ok().flatten();
+    match &handle {
+        Some(_) if out.1.is_some() => log::info!("player: audio output is back"),
+        Some(_) => {}
+        None => out.1 = Some(Instant::now()),
+    }
+    if handle.is_some() {
+        *STOP_OUTPUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop_tx);
+    }
+    out.0 = handle.clone();
+    handle
+}
+
+/// Tells the audio output's thread to close it.
+static STOP_OUTPUT: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+
+/// Silences your own music as the game closes. The game takes a
+/// moment to shut down after its window goes, and a file kept playing
+/// through it; the game's own songs stop with the game.
+pub fn silence_for_exit() {
+    CLOSING.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(stop) = STOP_OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = stop.send(());
+        log::info!("player: the game is closing, own music silenced");
+    }
+    // The handle to the closed stream is no use to anything after it.
+    OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).0 = None;
+}
+
+/// The game's window came back after all (a display mode change, not the
+/// game closing): your own music can open its output again.
+pub fn reopen_output() {
+    CLOSING.store(false, std::sync::atomic::Ordering::Relaxed);
+    log::info!("player: the game's window is back, own music can play again");
 }
 
 /// Opens the audio output ahead of time, off the game thread, so the first
@@ -85,11 +136,33 @@ enum Playing {
         fading: bool,
     },
     File {
-        sink: Sink,
+        /// Shared with a seek in progress (see `Command::Seek`).
+        sink: std::sync::Arc<Sink>,
         duration: Option<f32>,
         /// The file's key in `config.file_levels` and `file_peaks`.
         key: String,
+        /// Where the file was started: the sink counts from there.
+        offset: f32,
+        /// The file is still being opened on a thread of its own (a slow
+        /// drive or a big file mustn't hold up the game); `tick` takes it.
+        opening: Option<Receiver<Result<Opened, String>>>,
     },
+}
+
+impl Playing {
+    /// How far into a file it is.
+    fn file_pos(sink: &Sink, offset: f32) -> f32 {
+        offset + sink.get_pos().as_secs_f32()
+    }
+}
+
+/// A file opened, decoded and moved to its start, ready for its sink.
+struct Opened {
+    decoder: Decoder<BufReader<File>>,
+    duration: Option<f32>,
+    key: String,
+    /// Where it starts: 0 if it couldn't seek.
+    at: f32,
 }
 
 pub struct Player {
@@ -122,6 +195,9 @@ pub struct Player {
     /// was as it began.
     fight: bool,
     fight_resume: Option<(usize, f32)>,
+    /// The Play next song that's playing, and the song it cut in after (by
+    /// key), so the list carries on from that one afterwards.
+    after_up_next: Option<(String, Option<String>)>,
     /// The map last settled on while exploring, and a different one seen
     /// since and when it was first seen.
     map_id: i32,
@@ -138,7 +214,7 @@ pub struct Player {
     fade_in: Option<(Instant, f32)>,
     /// Files still fading out under the next song: sink, start, its level
     /// then, and how long.
-    fading_files: Vec<(Sink, Instant, f32, f32)>,
+    fading_files: Vec<(std::sync::Arc<Sink>, Instant, f32, f32)>,
     /// The last song from the previous session has been dealt with.
     resumed: bool,
     /// When the current song and position were last saved for resuming.
@@ -149,6 +225,12 @@ pub struct Player {
     duck_at: Instant,
     /// This battle's fanfare has played; cleared once the battle is over.
     after_fanfare: bool,
+    /// A song that would not start, whose next song is tried on the next
+    /// tick (see [`Player::skip_on`]).
+    skip_from: Option<usize>,
+    /// A rescan of the music folder running on a thread of its own; its
+    /// result is taken in on the tick it arrives.
+    scan: Option<Receiver<Vec<Track>>>,
 }
 
 /// What plays while exploring a place of this kind; a Vision shrine can be
@@ -182,6 +264,7 @@ impl Player {
             in_battle: false,
             fight: false,
             fight_resume: None,
+            after_up_next: None,
             map_id: 0,
             map_new: None,
             area: None,
@@ -196,6 +279,8 @@ impl Player {
             duck: 1.0,
             duck_at: Instant::now(),
             after_fanfare: false,
+            skip_from: None,
+            scan: None,
         }
     }
 
@@ -213,7 +298,9 @@ impl Player {
             },
         };
         match own {
-            Some(list) if s.songs_of_only(list, None).is_some() => list.clone(),
+            // "All songs" chosen for a battle or a place means all songs,
+            // whatever "Play from" is; it is never empty.
+            Some(list) if *list == Playlist::AllSongs || s.songs_of_only(list, None).is_some() => list.clone(),
             _ => s.config.playlist.clone(),
         }
     }
@@ -260,7 +347,7 @@ impl Player {
     fn position(&self, game: &mut Game) -> Option<(usize, f32)> {
         match &self.now {
             Some((i, Playing::Cue { id, .. })) => Some((*i, game.time(*id))),
-            Some((i, Playing::File { sink, .. })) => Some((*i, sink.get_pos().as_secs_f32())),
+            Some((i, Playing::File { sink, offset, .. })) => Some((*i, Playing::file_pos(sink, *offset))),
             None => None,
         }
     }
@@ -287,13 +374,29 @@ impl Player {
             self.advance_from(game, false, None);
         } else if let Some((i, at)) = self.battle_resume.take() {
             self.crossfade_next = true;
-            if state::lock().config.resume_after_battle {
-                log::info!("player: battle over, back to the exploring song at {at:.0}s");
-                self.start_at(i, at, game);
-            } else {
-                log::info!("player: battle over, on to the next exploring song");
-                self.advance_from(game, false, Some(i));
-            }
+            // Paused during the battle: the exploring song comes back paused.
+            self.keeping_intent(game, |p, game| {
+                if state::lock().config.resume_after_battle {
+                    log::info!("player: battle over, back to the exploring song at {at:.0}s");
+                    p.start_at(i, at, game);
+                } else {
+                    log::info!("player: battle over, on to the next exploring song");
+                    p.advance_from(game, false, Some(i));
+                }
+            });
+        }
+    }
+
+    /// Runs `f`, which starts a song by itself (not by your choice: a battle
+    /// ending, a seek, a retry), and keeps play or pause as it was: starting
+    /// a song counts as playing, which would undo a pause. A paused song is
+    /// paused at once, not a tick later.
+    fn keeping_intent(&mut self, game: &mut Game, f: impl FnOnce(&mut Self, &mut Game)) {
+        let was = state::lock().playing;
+        f(self, game);
+        if !was {
+            state::lock().playing = false;
+            self.set_paused(game, true);
         }
     }
 
@@ -317,16 +420,16 @@ impl Player {
         }
         let alive = match &self.now {
             Some((_, Playing::Cue { id, .. })) => game.exists(*id),
-            Some((_, Playing::File { sink, .. })) => !sink.empty(),
+            Some((_, Playing::File { sink, opening, .. })) => opening.is_some() || !sink.empty(),
             None => false,
         };
         if !state::lock().config.resume_after_battle {
             log::info!("player: battle over, on to the next exploring song");
             self.crossfade_next = true;
-            self.advance_from(game, false, Some(i));
+            self.keeping_intent(game, |p, game| p.advance_from(game, false, Some(i)));
         } else if !alive {
             log::info!("player: battle over, the exploring song was cut off; again from {at:.0}s");
-            self.start_at(i, at, game);
+            self.keeping_intent(game, |p, game| p.start_at(i, at, game));
         }
     }
 
@@ -527,11 +630,13 @@ impl Player {
                 s.config.crossfade_secs.max(0.0),
             )
         };
+        self.take_scan(game);
         for c in commands {
-            // Choosing other music replaces a pending retry; pausing,
+            // Choosing other music replaces a pending retry or skip; pausing,
             // seeking or rescanning leave it to go ahead.
             if matches!(c, Command::Play(_) | Command::Next | Command::Previous | Command::Stop) {
                 self.retry = None;
+                self.skip_from = None;
             }
             self.run(c, game);
         }
@@ -540,7 +645,10 @@ impl Player {
         {
             self.retry = None;
             log::info!("player: retrying (attempt {})", attempt + 1);
-            self.start_attempt(i, 0.0, attempt, game);
+            self.keeping_intent(game, |p, game| p.start_attempt(i, 0.0, attempt, game));
+        }
+        if let Some(i) = self.skip_from.take() {
+            self.advance_from(game, false, Some(i));
         }
         self.resume_last(game);
         // Boss battles can keep the game's own music, as the developers
@@ -552,6 +660,7 @@ impl Player {
         self.follow_map(game, scene, play_in);
         self.run_check(game);
         self.fade_files();
+        self.finish_opening();
 
         // A game cue that ended on its own, or a file that ran out. A cue
         // only counts as ended once it has been seen playing; one that never
@@ -562,9 +671,13 @@ impl Player {
         let (loop_battle, last) = {
             let s = state::lock();
             let current = self.now.as_ref().map(|(i, _)| *i);
+            // Only asked near the crossfade point (last tick's position, with
+            // a second to spare): working out the list every tick is wasted
+            // on a song in the middle.
+            let near_end = cf > 0.0 && s.duration.is_some_and(|d| s.position + 1.0 >= d - crossfade_for(cf, d));
             (
                 self.in_battle && s.config.loop_battle_song,
-                current.is_some_and(|c| self.ends_playlist(&s, c)),
+                near_end && current.is_some_and(|c| self.ends_playlist(&s, c)),
             )
         };
         // The last song of a playlist (Repeat off) plays to its end: there is
@@ -600,7 +713,7 @@ impl Player {
                 } else if !exists {
                     log::debug!("player: cue id {id} ended at {:.1}s", *reached);
                     true
-                } else if cf > 0.0 && duration.is_some_and(|d| time >= d - cf) {
+                } else if cf > 0.0 && duration.is_some_and(|d| time >= d - crossfade_for(cf, d)) {
                     // Over to the next song while this one fades out under it.
                     log::debug!("player: cue id {id} crossfading at {time:.1}s");
                     true
@@ -618,9 +731,11 @@ impl Player {
                     false
                 }
             }
-            Some((_, Playing::File { sink, duration, .. })) => {
+            // A paused file stays put, even one seeked into its last seconds.
+            Some((_, Playing::File { sink, duration, offset, opening: None, .. })) if !sink.is_paused() => {
                 sink.empty()
-                    || (cf > 0.0 && duration.is_some_and(|d| sink.get_pos().as_secs_f32() >= d - cf))
+                    || (cf > 0.0
+                        && duration.is_some_and(|d| Playing::file_pos(sink, *offset) >= d - crossfade_for(cf, d)))
             }
             _ => false,
         };
@@ -644,7 +759,7 @@ impl Player {
             self.stop(game);
             log::warn!("player: the game would not play {title} here, skipping it");
             state::lock().set_skipped(i, true);
-            self.skip_on(game, i, format!("The game won't play {title} here. Try it again later."));
+            self.skip_on(i, format!("The game won't play {title} here. Try it again later."));
         } else if finished {
             self.advance(game, true);
         }
@@ -652,7 +767,8 @@ impl Player {
         let playing = state::lock().playing;
         // The game's victory fanfare plays out over a won battle's results;
         // the jukebox picks up again once the game moves on from it.
-        let mut fanfare = fanfare_setting && game.current_bgm_cue().as_deref() == Some(crate::game::VICTORY_CUE);
+        let bgm_cue = game.current_bgm_cue();
+        let mut fanfare = fanfare_setting && bgm_cue.as_deref() == Some(crate::game::VICTORY_CUE);
         // The battle ends a moment after the fanfare does; the battle song
         // stays down until then instead of coming back for that moment.
         let in_battle_scene = scene == crate::config::Scene::Battle;
@@ -679,6 +795,24 @@ impl Player {
             self.mute.hold(game, own);
         } else {
             self.mute.release(game);
+        }
+        // The game's own song, heard while the game has the music, is kept
+        // so it can be favorited afterwards. Only one the song list knows,
+        // never while the song check is starting songs of its own, and not
+        // the victory fanfare, which would replace the song you meant after
+        // every won battle.
+        if !active
+            && self.check.is_none()
+            && scene != crate::config::Scene::Movie
+            && let Some(cue) = &bgm_cue
+            && cue != crate::game::VICTORY_CUE
+        {
+            let key = format!("game:{cue}");
+            let mut s = state::lock();
+            if s.heard.as_deref() != Some(key.as_str()) && s.index_of(&key).is_some() {
+                log::info!("player: heard the game play {cue}");
+                s.heard = Some(key);
+            }
         }
         // Volume rises gradually and falls at once: one click at the far end
         // of the slider would otherwise jump straight to 150%.
@@ -713,8 +847,8 @@ impl Player {
                 s.position = game.time(*id);
                 s.duration = if loop_battle && *fades { None } else { *duration };
             }
-            Some((_, Playing::File { sink, duration, .. })) => {
-                s.position = sink.get_pos().as_secs_f32();
+            Some((_, Playing::File { sink, duration, offset, .. })) => {
+                s.position = Playing::file_pos(sink, *offset);
                 s.duration = *duration;
             }
             None => {
@@ -726,9 +860,14 @@ impl Player {
 
     fn run(&mut self, command: Command, game: &mut Game) {
         match command {
-            Command::Play(i) => {
-                self.auto = false;
-                self.start(i, game);
+            Command::Play(key) => {
+                // A song gone from the list in the meantime: the one playing
+                // carries on.
+                let found = state::lock().index_of(&key);
+                if let Some(i) = found {
+                    self.auto = false;
+                    self.start(i, game);
+                }
             }
             Command::TogglePause => {
                 let mut s = state::lock();
@@ -747,8 +886,10 @@ impl Player {
                 }
                 self.mute.release(game);
                 self.battle_resume = None;
+                self.after_up_next = None;
                 let mut s = state::lock();
                 s.playing = false;
+                s.up_next = None;
                 // A stopped jukebox stays quiet at the next start too.
                 s.config.last_song = None;
                 s.save_config();
@@ -780,22 +921,28 @@ impl Player {
             Command::Seek(t) => match &mut self.now {
                 Some((i, Playing::Cue { .. })) => {
                     let i = *i;
-                    self.start_at(i, t, game);
-                    // Seeking while paused or held restarts the cue at the
-                    // new place, but silent: it is paused straight away
-                    // rather than at the next tick.
-                    let quiet = {
-                        let s = state::lock();
-                        !s.playing || s.held
-                    };
-                    if quiet {
+                    // Seeking restarts the cue at the new place. Paused, it
+                    // stays paused; while the game's music has the scene, it
+                    // is held silent at once rather than at the next tick.
+                    self.keeping_intent(game, |p, game| p.start_at(i, t, game));
+                    if state::lock().held {
                         self.set_paused(game, true);
                     }
                 }
-                Some((_, Playing::File { sink, .. })) => {
-                    let _ = sink.try_seek(Duration::from_secs_f32(t.max(0.0)));
+                // Not before it's open: the seek would go nowhere.
+                Some((_, Playing::File { sink, offset, opening: None, .. })) => {
+                    // The sink counts from wherever it seeks to. A seek waits
+                    // on the audio thread for a few milliseconds, so it's
+                    // done on a thread of its own, not the game's.
+                    *offset = 0.0;
+                    let sink = sink.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = sink.try_seek(Duration::from_secs_f32(t.max(0.0))) {
+                            log::warn!("player: can't seek ({e})");
+                        }
+                    });
                 }
-                None => {}
+                _ => {}
             },
             Command::ListChanged => {
                 // Only the list playing right now swaps the song, and only
@@ -815,38 +962,68 @@ impl Player {
                 self.last_list = list;
             }
             Command::Rescan => {
-                if matches!(self.now, Some((_, Playing::File { .. }))) {
-                    self.stop(game);
-                }
-                self.history.clear();
-                self.other_history.clear();
-                let mut s = state::lock();
-                let files = state::scan_folder(&s.music_dir);
-                log::info!("player: {} files in {}", files.len(), s.music_dir.display());
-                let old_files = s.tracks.iter().filter(|t| !t.is_game()).count();
-                let game_tracks: Vec<_> = s.tracks.drain(..).filter(|t| t.is_game()).collect();
-                // Game tracks keep their place after the files, so a playing
-                // cue's index moves by the change in file count.
-                let shift = files.len() as isize - old_files as isize;
-                s.tracks = files;
-                s.tracks.extend(game_tracks);
-                s.apply_titles();
-                // A file that would not play gets another try after a rescan;
-                // it may have been fixed or replaced.
-                s.skipped.retain(|k| !k.starts_with("file:"));
-                let moved = |i: usize| (i as isize + shift).max(0) as usize;
-                if let Some((i, _)) = &mut self.now {
-                    *i = moved(*i);
-                }
-                if let Some((i, _, _)) = &mut self.retry {
-                    *i = moved(*i);
-                }
-                // The songs waiting to come back after a battle move too.
-                for (i, _) in [&mut self.battle_resume, &mut self.fight_resume].into_iter().flatten() {
-                    *i = moved(*i);
+                // The folder is walked on a thread of its own: a big or slow
+                // folder must not hold up the game, nor the menu waiting on
+                // the shared state. The result is taken in by `take_scan`.
+                if self.scan.is_none() {
+                    let dir = state::lock().music_dir.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(state::scan_folder(&dir));
+                    });
+                    self.scan = Some(rx);
                 }
             }
         }
+    }
+
+    /// Takes in a finished rescan. Every song the player holds on to (the
+    /// one playing, one waiting on a retry or a skip, the ones to come back
+    /// after a battle) is found again by its key, since adding or removing
+    /// files moves songs around the list; one whose file is gone is let go.
+    fn take_scan(&mut self, game: &mut Game) {
+        let Some(rx) = &self.scan else { return };
+        let files = match rx.try_recv() {
+            Ok(files) => files,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.scan = None;
+                return;
+            }
+        };
+        self.scan = None;
+        let mut s = state::lock();
+        log::info!("player: {} files in {}", files.len(), s.music_dir.display());
+        let key_of = |s: &state::Shared, i: usize| s.tracks.get(i).map(|t| t.key.clone());
+        let now = self.now.as_ref().and_then(|(i, _)| key_of(&s, *i));
+        let retry = self.retry.and_then(|(i, ..)| key_of(&s, i));
+        let skip = self.skip_from.and_then(|i| key_of(&s, i));
+        let battle = self.battle_resume.and_then(|(i, _)| key_of(&s, i));
+        let fight = self.fight_resume.and_then(|(i, _)| key_of(&s, i));
+        s.set_files(files);
+        // A file that would not play gets another try after a rescan; it may
+        // have been fixed or replaced.
+        s.skipped.retain(|k| !k.starts_with("file:"));
+        let find = |key: Option<String>| key.and_then(|k| s.index_of(&k));
+        let (now_at, retry_at, skip_at) = (find(now), find(retry), find(skip));
+        let (battle_at, fight_at) = (find(battle), find(fight));
+        drop(s);
+        match (now_at, &mut self.now) {
+            (Some(at), Some((i, _))) => *i = at,
+            (None, Some(_)) => {
+                log::info!("player: the playing song's file is gone");
+                self.stop(game);
+            }
+            _ => {}
+        }
+        self.retry = self.retry.zip(retry_at).map(|((_, attempt, when), at)| (at, attempt, when));
+        self.skip_from = skip_at;
+        self.battle_resume = self.battle_resume.zip(battle_at).map(|((_, pos), at)| (at, pos));
+        self.fight_resume = self.fight_resume.zip(fight_at).map(|((_, pos), at)| (at, pos));
+        // History and shuffle deals hold places in the old list.
+        self.history.clear();
+        self.other_history.clear();
+        self.bags.clear();
     }
 
     fn advance(&mut self, game: &mut Game, natural_end: bool) {
@@ -855,7 +1032,23 @@ impl Player {
     }
 
     /// Starts the song after `current` (`None`: the playlist's first).
-    fn advance_from(&mut self, game: &mut Game, natural_end: bool, current: Option<usize>) {
+    fn advance_from(&mut self, game: &mut Game, natural_end: bool, mut current: Option<usize>) {
+        // A song lined up with Play next goes first, while exploring; a battle
+        // keeps its own music and the song waits for the fight to end.
+        let up_next = if self.in_battle { None } else { take_up_next(&mut state::lock()) };
+        if let Some((i, key)) = up_next {
+            let before = current.and_then(|c| state::lock().tracks.get(c).map(|t| t.key.clone()));
+            log::info!("player: playing the song lined up next");
+            self.after_up_next = Some((key, before));
+            self.auto = true;
+            self.start(i, game);
+            return;
+        }
+        // After a Play next song, the list goes on from the song it cut in
+        // after, not from the start.
+        if let Some(after) = self.after_up_next.take() {
+            current = after_up_next(&state::lock(), after, current);
+        }
         let (list, repeat, shuffle) = {
             let s = state::lock();
             let (repeat, shuffle) = self.repeat_and_shuffle(&s);
@@ -969,9 +1162,10 @@ impl Player {
                         fading: false,
                     })
                 }
+                // The game's sound system isn't ready: not the song's fault.
                 None => Err(format!("The game would not play {cue}")),
             },
-            Source::File(path) => play_file(path),
+            Source::File(path) => play_file(path, at),
         };
         let mut s = state::lock();
         match result {
@@ -989,29 +1183,63 @@ impl Player {
                 s.track_serial += 1;
                 self.volume = volume;
             }
+            // A file that won't open or decode turns up a moment later, in
+            // `finish_opening`.
             Err(e) => {
-                // A file that would not open or decode: skipped for this
-                // session (a rescan gives it another try), and on to the
-                // next song if a list picked it.
+                // No sound device (or the game's sound isn't up): every song
+                // would fail the same way, so nothing is skipped and nothing
+                // moves on. The next Play tries the device again.
                 log::error!("player: {e}");
-                s.set_skipped(i, true);
-                drop(s);
-                self.skip_on(game, i, e);
+                s.playing = false;
+                s.error = Some(e);
             }
         }
     }
 
     /// After song `i` would not play: on to the song after it if a list
     /// picked it (Next, Shuffle, a playlist), else stop with `error` shown.
-    /// Each skipped song leaves the lists for the session, so a list of songs
-    /// that all fail ends rather than going round for ever.
-    fn skip_on(&mut self, game: &mut Game, i: usize, error: String) {
+    /// The next song is tried on the next tick, not now, so a run of files
+    /// that won't open costs one attempt per tick instead of stalling one
+    /// frame of the game. Each skipped song leaves the lists for the session,
+    /// so a list of songs that all fail ends rather than going round for ever.
+    fn skip_on(&mut self, i: usize, error: String) {
         if self.auto {
-            self.advance_from(game, false, Some(i));
+            self.skip_from = Some(i);
         } else {
             let mut s = state::lock();
             s.playing = false;
             s.error = Some(error);
+        }
+    }
+
+    /// Hands a file that has finished opening to its sink. One that failed
+    /// is skipped like any song that won't play.
+    fn finish_opening(&mut self) {
+        let Some((i, Playing::File { sink, duration, key, offset, opening: opening @ Some(_) })) = &mut self.now
+        else {
+            return;
+        };
+        let result = match opening.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => Err("The song could not be opened".into()),
+            _ => return,
+        };
+        *opening = None;
+        match result {
+            Ok(o) => {
+                sink.append(o.decoder);
+                *duration = o.duration;
+                *key = o.key;
+                *offset = o.at;
+            }
+            Err(e) => {
+                let i = *i;
+                sink.stop();
+                self.now = None;
+                log::error!("player: {e}");
+                state::lock().set_skipped(i, true);
+                self.skip_on(i, e);
+            }
         }
     }
 
@@ -1024,6 +1252,13 @@ impl Player {
     }
 
     fn set_paused(&mut self, game: &mut Game, pause: bool) {
+        // A song fading out under the next stops with it, so a pause or a
+        // movie is quiet straight away.
+        if pause {
+            for (sink, ..) in self.fading_files.drain(..) {
+                sink.stop();
+            }
+        }
         match &mut self.now {
             Some((_, Playing::Cue { id, paused, started, seen, .. })) if *paused != pause => {
                 if pause { game.pause(*id) } else { game.resume(*id) }
@@ -1042,20 +1277,67 @@ impl Player {
     }
 }
 
-/// Starts a file silent; `tick` sets its levelled volume straight after.
-fn play_file(path: &Path) -> Result<Playing, String> {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let handle = output().ok_or("No audio output device")?;
-    let file = File::open(path).map_err(|e| format!("Could not open {name}: {e}"))?;
-    let decoder =
-        Decoder::new(BufReader::new(file)).map_err(|e| format!("Could not decode {name}: {e}"))?;
-    let duration = decoder.total_duration().map(|d| d.as_secs_f32());
-    let sink = Sink::try_new(handle).map_err(|e| format!("Audio output failed: {e}"))?;
-    let key = loudness::key(path, &state::lock().music_dir);
-    loudness::ensure_measured(path, &key);
+/// The song lined up with Play next, taken off the queue: its place in the
+/// list and its key. One that's gone or won't play is dropped.
+fn take_up_next(s: &mut state::Shared) -> Option<(usize, String)> {
+    let key = s.up_next.take()?;
+    let i = s.index_of(&key).filter(|&i| !s.is_unplayable(i))?;
+    Some((i, key))
+}
+
+/// Where the list goes on from: after the Play next song `played`, the song
+/// it cut in after; any other song (one picked by hand since) is `current`.
+fn after_up_next(s: &state::Shared, (played, before): (String, Option<String>), current: Option<usize>) -> Option<usize> {
+    if current.is_some_and(|c| s.tracks.get(c).is_some_and(|t| t.key == played)) {
+        before.and_then(|k| s.index_of(&k))
+    } else {
+        current
+    }
+}
+
+/// How long before its end a song of `duration` seconds crossfades into
+/// the next: the crossfade setting, but never more than a third of the
+/// song, so a short one is heard before it fades rather than skipped at once.
+fn crossfade_for(cf: f32, duration: f32) -> f32 {
+    cf.min(duration / 3.0)
+}
+
+const NO_OUTPUT: &str = "No sound device for your own music. Check your speakers or headphones, then press Play.";
+
+/// Starts a file silent, `at` seconds in; `tick` sets its levelled volume
+/// straight after. Opening, decoding and seeking happen on a thread of their
+/// own, and `tick` hands the file to its sink once it's ready.
+fn play_file(path: &Path, at: f32) -> Result<Playing, String> {
+    let handle = output().ok_or_else(|| NO_OUTPUT.to_string())?;
+    let sink = Sink::try_new(&handle).map_err(|e| format!("{NO_OUTPUT} ({e})"))?;
     sink.set_volume(0.0);
-    sink.append(decoder);
-    Ok(Playing::File { sink, duration, key })
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(open_file(&path, at));
+    });
+    let offset = if at.is_finite() { at.max(0.0) } else { 0.0 };
+    Ok(Playing::File { sink: std::sync::Arc::new(sink), duration: None, key: String::new(), offset, opening: Some(rx) })
+}
+
+/// Opens and decodes a file and moves it `at` seconds in. A file that can't
+/// seek starts from the top.
+fn open_file(path: &Path, at: f32) -> Result<Opened, String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let file = File::open(path).map_err(|e| format!("Could not open {name}: {e}"))?;
+    let mut decoder = Decoder::new(BufReader::new(file)).map_err(|e| format!("Could not decode {name}: {e}"))?;
+    let duration = decoder.total_duration().map(|d| d.as_secs_f32());
+    let mut start = 0.0;
+    if at > 0.5 && at.is_finite() {
+        match decoder.try_seek(Duration::from_secs_f32(at)) {
+            Ok(()) => start = at,
+            Err(e) => log::warn!("player: can't seek in {name} ({e}), starting from the top"),
+        }
+    }
+    let music_dir = state::lock().music_dir.clone();
+    let key = loudness::key(path, &music_dir);
+    loudness::ensure_measured(path, &key);
+    Ok(Opened { decoder, duration, key, at: start })
 }
 
 /// What a file plays at: your volume, its levelling gain (a safe guess
@@ -1142,6 +1424,42 @@ mod tests {
         p.area = Some(Area::Town);
         s.config.town_music = AreaMusic::List(Playlist::Folder("Nope".into()));
         assert_eq!(p.list_now(&s), Playlist::Favorites);
+        // "All songs" chosen on purpose is used, not taken for empty.
+        s.config.town_music = AreaMusic::List(Playlist::AllSongs);
+        assert_eq!(p.list_now(&s), Playlist::AllSongs);
+        p.area = None;
+        p.in_battle = true;
+        s.config.battle_playlist = Some(Playlist::AllSongs);
+        assert_eq!(p.list_now(&s), Playlist::AllSongs);
+    }
+
+    #[test]
+    fn a_rescan_finds_held_songs_again_by_key() {
+        let file = |rel: &str| state::Track {
+            title: rel.into(),
+            base_title: rel.into(),
+            key: format!("file:{rel}"),
+            source: Source::File(rel.into()),
+        };
+        // The only test that uses the shared state.
+        state::init(state::Shared {
+            config_path: std::env::temp_dir().join("ffrs_jukebox_rescan_test.toml"),
+            tracks: vec![file("a.mp3"), file("c.mp3"), file("gone.mp3"), state::Track::game("BGM_PP_T0".into(), true)],
+            ..Default::default()
+        });
+        let mut p = Player::new();
+        p.battle_resume = Some((1, 30.0)); // c.mp3
+        p.fight_resume = Some((2, 5.0)); // gone.mp3
+        p.skip_from = Some(3); // the game song
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![file("a.mp3"), file("b.mp3"), file("c.mp3")]).unwrap();
+        p.scan = Some(rx);
+        p.take_scan(&mut Game::none());
+        let s = state::lock();
+        assert_eq!(p.battle_resume, Some((2, 30.0)), "c.mp3 moved one along, not by the file count");
+        assert_eq!(p.fight_resume, None, "a removed file is let go");
+        assert_eq!(p.skip_from.map(|i| s.tracks[i].key.clone()), Some("game:BGM_PP_T0".into()));
+        assert!(p.scan.is_none());
     }
 
     #[test]
@@ -1158,5 +1476,32 @@ mod tests {
         p.in_battle = false;
         let rest: Vec<usize> = (0..list.len() - 1).map(|_| p.draw(&list, None).unwrap()).collect();
         assert!(!rest.contains(&first));
+    }
+
+    #[test]
+    fn a_short_song_is_heard_before_it_crossfades() {
+        // Eight seconds of crossfade on a two-second jingle: it plays most of
+        // its length, not none of it.
+        assert!((crossfade_for(8.0, 2.0) - 2.0 / 3.0).abs() < 1e-6);
+        assert_eq!(crossfade_for(8.0, 240.0), 8.0);
+        assert_eq!(crossfade_for(0.0, 240.0), 0.0);
+    }
+
+    #[test]
+    fn play_next_cuts_in_once_and_the_list_carries_on() {
+        let mut s = three_songs();
+        s.up_next = Some(s.tracks[2].key.clone());
+        assert_eq!(take_up_next(&mut s), Some((2, s.tracks[2].key.clone())));
+        assert_eq!(take_up_next(&mut s), None, "it plays once");
+        // Song 0 was playing when song 2 cut in: the list goes on after 0.
+        let after = (s.tracks[2].key.clone(), Some(s.tracks[0].key.clone()));
+        assert_eq!(after_up_next(&s, after.clone(), Some(2)), Some(0));
+        // A song picked by hand meanwhile keeps its own place.
+        assert_eq!(after_up_next(&s, after, Some(1)), Some(1));
+        // A song that won't play is dropped from the queue.
+        s.up_next = Some(s.tracks[1].key.clone());
+        s.set_skipped(1, true);
+        assert_eq!(take_up_next(&mut s), None);
+        assert_eq!(s.up_next, None);
     }
 }

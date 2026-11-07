@@ -46,8 +46,12 @@ pub fn ensure_measured(path: &Path, key: &str) {
             return;
         }
     }
-    // One measurement per file at a time, however often it is replayed.
-    if MEASURING.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string()) {
+    // One measurement per file at a time, however often it is replayed, and
+    // two at most in all: skipping through new files doesn't start a decoder
+    // for each. One left out is measured the next time it plays.
+    let mut measuring = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    if measuring.len() < MAX_MEASURING && measuring.insert(key.to_string()) {
+        drop(measuring);
         let (path, key) = (path.to_path_buf(), key.to_string());
         std::thread::spawn(move || {
             measure_and_store(&path, &key);
@@ -63,6 +67,7 @@ pub fn saved(key: &str) -> (Option<f32>, Option<f32>) {
 }
 
 static MEASURING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+const MAX_MEASURING: usize = 2;
 
 fn measure_and_store(path: &Path, key: &str) {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

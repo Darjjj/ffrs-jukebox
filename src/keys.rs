@@ -257,6 +257,9 @@ static HIDE_BUTTONS: AtomicU16 = AtomicU16::new(0);
 static HIDE_ALL: AtomicBool = AtomicBool::new(false);
 /// The right stick is hidden from the game (it's moving the jukebox).
 static HIDE_RIGHT_STICK: AtomicBool = AtomicBool::new(false);
+/// Triggers bound to a jukebox action, kept from the game while the hold
+/// button is down: 1 for LT, 2 for RT. They aren't in `wButtons`.
+static HIDE_TRIGGERS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// What the game's import entry held before the filter took its place:
 /// XInputGetState, or Steam's hook of it.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -291,6 +294,13 @@ unsafe extern "system" fn get_state_filter(slot: u32, state: *mut XINPUT_STATE) 
             if HIDE_RIGHT_STICK.load(Ordering::Relaxed) {
                 s.Gamepad.sThumbRX = 0;
                 s.Gamepad.sThumbRY = 0;
+            }
+            let triggers = HIDE_TRIGGERS.load(Ordering::Relaxed);
+            if triggers & 1 != 0 {
+                s.Gamepad.bLeftTrigger = 0;
+            }
+            if triggers & 2 != 0 {
+                s.Gamepad.bRightTrigger = 0;
             }
         }
     }
@@ -374,15 +384,24 @@ pub fn keep_xinput_filtered() {
         log::warn!("keys: something keeps taking the game's XInputGetState entry back; leaving it be");
         return;
     }
-    NEXT.store(now, Ordering::Relaxed);
     let mut old = PAGE_PROTECTION_FLAGS(0);
     let slot = entry.slot as *const std::ffi::c_void;
     if unsafe { VirtualProtect(slot, 8, PAGE_READWRITE, &mut old) }.is_err() {
         log::warn!("keys: could not reroute the game's XInputGetState");
         return;
     }
-    unsafe { std::ptr::write_volatile(entry.slot, filter) };
+    let previous = NEXT.swap(now, Ordering::SeqCst);
+    // Only over the very entry read above: if another hook took the slot in
+    // the meantime, it is left in place and the next frame looks again.
+    // Import slots are pointer-aligned, as an atomic needs.
+    let swapped = unsafe { AtomicUsize::from_ptr(entry.slot) }
+        .compare_exchange(now, filter, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
     let _ = unsafe { VirtualProtect(slot, 8, old, &mut old) };
+    if !swapped {
+        NEXT.store(previous, Ordering::SeqCst);
+        return;
+    }
     log::info!("keys: game's XInputGetState rerouted through the jukebox, calling on to {}", module_of(now));
 }
 
@@ -500,6 +519,17 @@ pub fn combos(now: &PadState, fresh: &[PadButton], b: &PadBinds, on: bool, navig
     let holding = on && now.held(b.hold);
     let hide = if holding { actions.iter().fold(0, |m, (btn, _)| m | btn.bit()) } else { 0 };
     HIDE_BUTTONS.store(hide, Ordering::Relaxed);
+    // The hold button itself stays with the game, as the controls say.
+    let triggers = if holding {
+        actions.iter().filter(|(btn, _)| *btn != b.hold).fold(0, |m, (btn, _)| match btn {
+            PadButton::LT => m | 1,
+            PadButton::RT => m | 2,
+            _ => m,
+        })
+    } else {
+        0
+    };
+    HIDE_TRIGGERS.store(triggers, Ordering::Relaxed);
     // Hold + right stick moves the jukebox, not the camera.
     HIDE_RIGHT_STICK.store(holding, Ordering::Relaxed);
     if !holding {

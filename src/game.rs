@@ -51,11 +51,35 @@ thread_local! {
     static PLAYER: std::cell::RefCell<Option<Player>> = const { std::cell::RefCell::new(None) };
 }
 
+/// A tick slower than this is logged with where its time went, so a hitch
+/// can be traced to the jukebox (or ruled out).
+const SLOW_TICK: std::time::Duration = std::time::Duration::from_millis(4);
+
+thread_local! {
+    /// How long this tick's object scan (see [`watch`]) and scene check took.
+    static TIMES: std::cell::Cell<(std::time::Duration, std::time::Duration)> =
+        const { std::cell::Cell::new((std::time::Duration::ZERO, std::time::Duration::ZERO)) };
+}
+
 fn tick() {
+    let started = std::time::Instant::now();
+    TIMES.set(Default::default());
     PLAYER.with_borrow_mut(|player| {
         let player = player.get_or_insert_with(Player::new);
         player.tick(&mut Game::get());
     });
+    let took = started.elapsed();
+    if took > SLOW_TICK {
+        let (scan, scene) = TIMES.get();
+        log::warn!(
+            "tick: slow, {:.1} ms (object scan {:.1}, scene {:.1}, the rest {:.1}; {} objects)",
+            took.as_secs_f32() * 1000.0,
+            scan.as_secs_f32() * 1000.0,
+            scene.as_secs_f32() * 1000.0,
+            (took.saturating_sub(scan + scene)).as_secs_f32() * 1000.0,
+            rt::GObjects.Num(),
+        );
+    }
 }
 
 /// The game's sound manager, found once and kept: it is a game-instance
@@ -73,24 +97,41 @@ const EVENT_GAP_MS: u64 = 500;
 const TALK_GAP_MS: u64 = 100;
 
 fn sound_manager() -> *mut UCPP_SoundManager {
+    static SEARCH_POS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     let found = SOUND_MANAGER.load(Ordering::Relaxed);
     if !found.is_null() {
         return found;
     }
-    // A full GObjects walk; only retried every two seconds until it succeeds.
     let now = unsafe { GetTickCount64() };
     if now < NEXT_SEARCH.load(Ordering::Relaxed) {
         return null_mut();
     }
-    NEXT_SEARCH.store(now + 2000, Ordering::Relaxed);
+    // A walk of GObjects a slice per tick, like the watch's, so the game
+    // thread never stalls on a whole walk at once; a walk that found nothing
+    // waits two seconds before the next.
     let class = UCPP_SoundManager::static_class();
-    for obj in rt::GObjects.iter() {
-        let o = unsafe { &*obj };
+    let num = rt::GObjects.Num();
+    let pos = SEARCH_POS.load(Ordering::Relaxed).min(num);
+    let mut end = (pos + WATCH_SLICE).min(num);
+    let started = std::time::Instant::now();
+    for index in pos..end {
+        if index % 512 == 0 && index > pos && started.elapsed() > WATCH_BUDGET {
+            end = index;
+            break;
+        }
+        let obj = rt::GObjects.GetByIndex(index);
+        let Some(o) = (unsafe { obj.as_ref() }) else { continue };
         if o.Class == class && !o.IsDefaultObject() {
             log::info!("game: sound manager at {obj:p}");
             SOUND_MANAGER.store(obj.cast(), Ordering::Relaxed);
             return obj.cast();
         }
+    }
+    if end >= num {
+        SEARCH_POS.store(0, Ordering::Relaxed);
+        NEXT_SEARCH.store(now + 2000, Ordering::Relaxed);
+    } else {
+        SEARCH_POS.store(end, Ordering::Relaxed);
     }
     null_mut()
 }
@@ -121,8 +162,12 @@ enum Kind {
     Other,
 }
 
-/// Objects walked per tick: a full pass takes well under a second.
+/// Objects walked per tick, at most: a full pass takes well under a second.
 const WATCH_SLICE: i32 = 25_000;
+/// And for no longer than this per tick. Loading a save creates thousands of
+/// new kinds of object, each looked up once, which made a slice take 4 ms;
+/// a slow slice now stops early and the walk carries on next tick.
+const WATCH_BUDGET: std::time::Duration = std::time::Duration::from_micros(1500);
 
 static WATCH: std::sync::Mutex<Option<Watch>> = std::sync::Mutex::new(None);
 
@@ -146,8 +191,14 @@ fn kind_of(class: *mut sdk::config::UClass) -> Kind {
 /// Walks the next slice of GObjects.
 fn watch_step(w: &mut Watch) {
     let num = rt::GObjects.Num();
-    let end = (w.pos + WATCH_SLICE).min(num);
+    let mut end = (w.pos + WATCH_SLICE).min(num);
+    let started = std::time::Instant::now();
     for index in w.pos..end {
+        // The clock is read every 512 objects, not every one.
+        if index % 512 == 0 && index > w.pos && started.elapsed() > WATCH_BUDGET {
+            end = index;
+            break;
+        }
         let obj = rt::GObjects.GetByIndex(index);
         let Some(o) = (unsafe { obj.as_ref() }) else { continue };
         if o.Class.is_null() || o.IsDefaultObject() {
@@ -269,6 +320,12 @@ impl Game {
         Self { sm: sound_manager() }
     }
 
+    /// A game with no sound manager, for tests: every call is a no-op.
+    #[cfg(test)]
+    pub fn none() -> Self {
+        Self { sm: null_mut() }
+    }
+
     pub fn ready(&self) -> bool {
         !self.sm.is_null()
     }
@@ -284,7 +341,15 @@ impl Game {
         // one) can't be muted like the game's music, so the jukebox steps
         // aside for it. Silent movies play the game's music tracks instead,
         // which the jukebox replaces as usual.
+        let started = std::time::Instant::now();
         let movie = watch();
+        let scanned = started.elapsed();
+        let scene = self.scene_after_watch(movie);
+        TIMES.set((scanned, started.elapsed().saturating_sub(scanned)));
+        scene
+    }
+
+    fn scene_after_watch(&mut self, movie: bool) -> Scene {
         if !self.ready() {
             return if movie { Scene::Movie } else { Scene::Exploring };
         }

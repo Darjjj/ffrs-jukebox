@@ -99,44 +99,16 @@ fn main(this_module: HMODULE) {
         config.save(&config_path);
     }
     let music_dir = config.music_dir(&dir);
-    let tracks = state::scan_folder(&music_dir);
-    log::info!("main: {} files in {}", tracks.len(), music_dir.display());
-    state::init(state::Shared { config, config_path, music_dir, tracks, ..Default::default() });
-    state::lock().apply_titles();
+    // A big music folder on a slow drive can take a while to go through, and
+    // the renderer hook must not wait for it (see below).
+    let scan = {
+        let music_dir = music_dir.clone();
+        std::thread::spawn(move || state::scan_folder(&music_dir))
+    };
+    state::init(state::Shared { config, config_path, music_dir: music_dir.clone(), ..Default::default() });
     // Opening the audio output takes a moment; done here rather than on the
     // game thread when the first file plays.
     player::warm_up();
-
-    // Game-thread entry for the player: inside UObject::ProcessEvent, not at its
-    // entry. The ultrawide fix finds ProcessEvent by its first 0x55 bytes, so a
-    // hook there hides it. +0x8C is the `je` both paths reach (native via the
-    // jmp at +0x87, script by falling through +0x89), and nothing jumps into
-    // its middle. Checked against the bytes first; the entry is the fallback.
-    let base = unsafe { GetModuleHandleA(None) }.map(|h| h.0 as usize).unwrap_or(0);
-    let entry = (base + sdk::config::PROCESS_EVENT) as *mut u8;
-    let expected: [(usize, &[u8]); 3] =
-        [(0x00, &[0x40, 0x55, 0x56, 0x57]), (0x87, &[0xEB, 0x03]), (0x8C, &[0x0F, 0x84])];
-    let inner = expected
-        .iter()
-        .all(|(at, bytes)| unsafe { std::slice::from_raw_parts(entry.add(*at), bytes.len()) } == *bytes);
-    let process_event = if inner {
-        unsafe { entry.add(0x8C) }
-    } else {
-        log::warn!("main: ProcessEvent+0x8C not as expected, hooking its entry instead");
-        entry
-    };
-    match MidHook::install(process_event, |_ctx| game::on_process_event()) {
-        Ok(hook) => {
-            // The hook stays for the life of the game, whatever a future
-            // grapnel does on drop.
-            std::mem::forget(hook);
-            log::info!("main: ProcessEvent hooked @ {process_event:p}");
-        }
-        Err(e) => {
-            log::error!("main: could not hook ProcessEvent: {e}");
-            return;
-        }
-    }
 
     // Hooking the renderer freezes every thread of the game for a moment
     // (and builds a throwaway graphics device). Once the game's sound is
@@ -147,6 +119,7 @@ fn main(this_module: HMODULE) {
     while !keys::game_window_exists() && waited.elapsed() < std::time::Duration::from_secs(5) {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    let window_seen = keys::game_window_exists();
     let waited = waited.elapsed().as_secs_f32();
     let hooking = std::time::Instant::now();
     match hudhook::Hudhook::builder()
@@ -159,6 +132,89 @@ fn main(this_module: HMODULE) {
             hooking.elapsed().as_millis()
         ),
         Err(e) => log::error!("main: overlay hook failed: {e:?}"),
+    }
+
+    // Your own files are in before the player first runs, so last session's
+    // song can pick up where it left off.
+    let tracks = scan.join().unwrap_or_default();
+    log::info!("main: {} files in {}", tracks.len(), music_dir.display());
+    state::lock().set_files(tracks);
+
+    hook_process_event();
+
+    // Once the game's window is gone the game is closing: your own music
+    // stops there and then, not a second later when the process ends.
+    // Only a window that was there counts, and it must be gone twice in a
+    // row; one that comes back (a display mode change) gets the music back.
+    let mut seen = window_seen;
+    let mut gone = 0;
+    let mut silenced = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if keys::game_window_exists() {
+            seen = true;
+            gone = 0;
+            if silenced {
+                silenced = false;
+                player::reopen_output();
+            }
+        } else if seen {
+            gone += 1;
+            if gone >= 2 && !silenced {
+                silenced = true;
+                player::silence_for_exit();
+            }
+        }
+    }
+}
+
+/// The start of the game's executable image and its size in memory.
+fn game_image() -> Option<(usize, usize)> {
+    let base = unsafe { GetModuleHandleA(None) }.ok()?.0 as usize;
+    // The DOS header's e_lfanew, then the optional header's SizeOfImage.
+    let nt = unsafe { std::ptr::read_unaligned((base + 0x3C) as *const u32) } as usize;
+    let size = unsafe { std::ptr::read_unaligned((base + nt + 0x50) as *const u32) } as usize;
+    Some((base, size))
+}
+
+/// Game-thread entry for the player: inside UObject::ProcessEvent, not at
+/// its entry. The ultrawide fix finds ProcessEvent by its first 0x55 bytes,
+/// so a hook there hides it. +0x8C is the `je` both paths reach (native via
+/// the jmp at +0x87, script by falling through +0x89), and nothing jumps into
+/// its middle. Checked against the bytes first. On a game update that moved
+/// ProcessEvent, nothing is hooked at all: hooking whatever lies there now
+/// would crash the game.
+fn hook_process_event() {
+    let unsupported = |why: &str| {
+        log::error!("main: {why}; the jukebox stays off on this game version");
+        state::lock().error =
+            Some("This version of the game isn't supported yet. Check for a jukebox update.".into());
+    };
+    let Some((base, size)) = game_image() else {
+        return unsupported("could not find the game's image");
+    };
+    if sdk::config::PROCESS_EVENT + 0x90 > size {
+        return unsupported("ProcessEvent lies outside the game's image");
+    }
+    let entry = (base + sdk::config::PROCESS_EVENT) as *mut u8;
+    let at = |offset: usize, bytes: &[u8]| unsafe { std::slice::from_raw_parts(entry.add(offset), bytes.len()) } == bytes;
+    if !at(0x00, &[0x40, 0x55, 0x56, 0x57]) {
+        return unsupported("ProcessEvent isn't where this jukebox expects it");
+    }
+    let process_event = if at(0x87, &[0xEB, 0x03]) && at(0x8C, &[0x0F, 0x84]) {
+        unsafe { entry.add(0x8C) }
+    } else {
+        log::warn!("main: ProcessEvent+0x8C not as expected, hooking its entry instead");
+        entry
+    };
+    match MidHook::install(process_event, |_ctx| game::on_process_event()) {
+        Ok(hook) => {
+            // The hook stays for the life of the game, whatever a future
+            // grapnel does on drop.
+            std::mem::forget(hook);
+            log::info!("main: ProcessEvent hooked @ {process_event:p}");
+        }
+        Err(e) => log::error!("main: could not hook ProcessEvent: {e}"),
     }
 }
 

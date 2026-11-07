@@ -117,6 +117,8 @@ pub enum Playlist {
     #[default]
     AllSongs,
     Favorites,
+    /// The game's full-length songs, without its short jingles and stingers.
+    GameThemes,
     /// One of your own playlists, by name.
     Custom(String),
     /// A folder inside the music folder, by its name: every song in it.
@@ -128,6 +130,7 @@ impl Playlist {
         match self {
             Playlist::AllSongs => "All songs".into(),
             Playlist::Favorites => "Favorites".into(),
+            Playlist::GameThemes => "Game themes".into(),
             Playlist::Custom(name) => name.clone(),
             Playlist::Folder(name) => format!("Folder: {name}"),
         }
@@ -598,30 +601,32 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-                // Kept aside before anything is saved over it, so favorites,
-                // playlists and keys in a damaged file can still be recovered.
-                let backup = path.with_extension("toml.bad");
-                match std::fs::copy(path, &backup) {
-                    Ok(_) => log::error!(
-                        "config: {} is invalid, using defaults; the old file is kept as {}: {e}",
-                        path.display(),
-                        backup.display()
-                    ),
-                    Err(ce) => log::error!(
-                        "config: {} is invalid ({e}) and could not be backed up: {ce}",
-                        path.display()
-                    ),
-                }
-                Self::default()
-            }),
-            Err(_) => {
+        let parsed = match std::fs::read(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let config = Self::default();
                 config.save(path);
-                config
+                return config;
             }
-        }
+            Err(e) => Err(format!("could not be read: {e}")),
+            // Notepad's "Unicode" saves UTF-16, which isn't TOML.
+            Ok(bytes) => String::from_utf8(bytes)
+                .map_err(|_| "isn't saved as UTF-8".to_string())
+                .and_then(|text| toml::from_str(&text).map_err(|e| format!("is invalid: {e}"))),
+        };
+        parsed.unwrap_or_else(|why| {
+            // Kept aside before anything is saved over it, so favorites,
+            // playlists and keys in a damaged file can still be recovered.
+            let backup = path.with_extension("toml.bad");
+            match std::fs::copy(path, &backup) {
+                Ok(_) => log::error!(
+                    "config: {} {why}; using defaults, the old file is kept as {}",
+                    path.display(),
+                    backup.display()
+                ),
+                Err(ce) => log::error!("config: {} {why}, and could not be backed up: {ce}", path.display()),
+            }
+            Self::default()
+        })
     }
 
     /// Hands a copy to the writer thread, which writes it after a short
@@ -798,5 +803,21 @@ mod tests {
         assert_eq!(old.settings_size, None);
         // An unset window size isn't written out.
         assert!(!toml::to_string(&old).unwrap().contains("settings_size"));
+    }
+
+    #[test]
+    fn a_settings_file_that_isnt_utf8_is_kept_aside_not_lost() {
+        let dir = std::env::temp_dir().join(format!("ffrs_jukebox_utf16_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ffrs_jukebox.toml");
+        // "volume = 0.5" as Notepad's UTF-16, with its byte order mark.
+        let bytes: Vec<u8> =
+            [0xFF, 0xFE].into_iter().chain("volume = 0.5".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let config = Config::load(&path);
+        assert_eq!(config.volume, Config::default().volume);
+        assert_eq!(std::fs::read(path.with_extension("toml.bad")).unwrap(), bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the file itself isn't saved over at load");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
