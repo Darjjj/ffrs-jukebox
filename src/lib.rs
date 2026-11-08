@@ -17,7 +17,7 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use grapnel::MidHook;
 use windows::Win32::Foundation::{HMODULE, SYSTEMTIME};
@@ -27,7 +27,8 @@ use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
 fn module_dir(module: HMODULE) -> PathBuf {
-    let mut buf = [0u16; 260];
+    // Long enough for any path Windows allows, not just the classic 260.
+    let mut buf = vec![0u16; 32_768];
     let len = unsafe { GetModuleFileNameW(module, &mut buf) } as usize;
     PathBuf::from(String::from_utf16_lossy(&buf[..len]))
         .parent()
@@ -35,23 +36,37 @@ fn module_dir(module: HMODULE) -> PathBuf {
         .unwrap_or_default()
 }
 
-/// The game exe's size and modified time, which change with every update.
+/// The game build, for the song check and the songs known to have no audio:
+/// the exe's link time stamp, which changes with every update and with
+/// nothing else (a Steam file check that rewrites the exe doesn't change it).
 fn game_build() -> String {
-    std::env::current_exe()
-        .and_then(std::fs::metadata)
-        .map(|m| {
-            let modified = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs());
-            format!("{}-{modified}", m.len())
-        })
-        .unwrap_or_default()
+    match game_image() {
+        Some((_, _, stamp)) => format!("{stamp:#010X}"),
+        None => std::env::current_exe()
+            .and_then(std::fs::metadata)
+            .map(|m| format!("{}", m.len()))
+            .unwrap_or_default(),
+    }
 }
 
+/// Logs to the file from a thread of its own: a line costs the thread that
+/// logs it a channel send, not a write to the disk (the game thread logs
+/// too). Lines are written as they arrive and flushed when the queue is
+/// empty, so the file is current within a moment.
 fn init_logging(path: &std::path::Path) {
+    use std::io::Write;
     let Ok(file) = File::create(path) else { return };
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut file = std::io::BufWriter::new(file);
+        while let Ok(line) = rx.recv() {
+            let _ = file.write_all(line.as_bytes());
+            while let Ok(line) = rx.try_recv() {
+                let _ = file.write_all(line.as_bytes());
+            }
+            let _ = file.flush();
+        }
+    });
     let _ = fern::Dispatch::new()
         .format(|out, message, record| {
             let t: SYSTEMTIME = unsafe { GetLocalTime() };
@@ -66,7 +81,7 @@ fn init_logging(path: &std::path::Path) {
         // The decoder narrates every byte it skips in a damaged file; the
         // jukebox's own "could not decode" line says all that's needed.
         .filter(|meta| !meta.target().starts_with("symphonia") || meta.level() <= log::Level::Error)
-        .chain(file)
+        .chain(tx)
         .apply();
 }
 
@@ -106,6 +121,12 @@ fn main(this_module: HMODULE) {
         std::thread::spawn(move || state::scan_folder(&music_dir))
     };
     state::init(state::Shared { config, config_path, music_dir: music_dir.clone(), ..Default::default() });
+    if !config::persisting() {
+        state::lock().notice = Some(
+            "Your settings file couldn't be read, so nothing is saved this session. Close the game and check ffrs_jukebox.toml."
+                .into(),
+        );
+    }
     // Opening the audio output takes a moment; done here rather than on the
     // game thread when the first file plays.
     player::warm_up();
@@ -163,36 +184,68 @@ fn main(this_module: HMODULE) {
             if gone >= 2 && !silenced {
                 silenced = true;
                 player::silence_for_exit();
+                // The game ends soon after its window: whatever the settings
+                // writer still holds (the song to resume, a late change)
+                // goes to the disk now, before the thread is cut off.
+                state::lock().save_config();
+                config::flush(std::time::Duration::from_millis(1500));
             }
         }
     }
 }
 
-/// The start of the game's executable image and its size in memory.
-fn game_image() -> Option<(usize, usize)> {
+/// The game build this jukebox was made for: the link time stamped in the
+/// exe's PE header, the same on every install of one build. The SDK's
+/// addresses and layouts (ProcessEvent, GObjects, GNames, every class) hold
+/// for this build only, so on any other the jukebox stays off rather than
+/// read the wrong memory. A game update means a jukebox update.
+const SUPPORTED_BUILD: u32 = 0x6A58_6B2F;
+
+/// The game isn't the build this jukebox was made for: the player never
+/// runs, and the overlay only says so (no playback, no controller hooks).
+pub static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// The game's executable image: where it starts, its size in memory, and
+/// its link time stamp.
+fn game_image() -> Option<(usize, usize, u32)> {
     let base = unsafe { GetModuleHandleA(None) }.ok()?.0 as usize;
-    // The DOS header's e_lfanew, then the optional header's SizeOfImage.
+    // The DOS header's e_lfanew, then the file header's TimeDateStamp and
+    // the optional header's SizeOfImage.
     let nt = unsafe { std::ptr::read_unaligned((base + 0x3C) as *const u32) } as usize;
+    let stamp = unsafe { std::ptr::read_unaligned((base + nt + 0x08) as *const u32) };
     let size = unsafe { std::ptr::read_unaligned((base + nt + 0x50) as *const u32) } as usize;
-    Some((base, size))
+    Some((base, size, stamp))
 }
 
 /// Game-thread entry for the player: inside UObject::ProcessEvent, not at
 /// its entry. The ultrawide fix finds ProcessEvent by its first 0x55 bytes,
 /// so a hook there hides it. +0x8C is the `je` both paths reach (native via
 /// the jmp at +0x87, script by falling through +0x89), and nothing jumps into
-/// its middle. Checked against the bytes first. On a game update that moved
-/// ProcessEvent, nothing is hooked at all: hooking whatever lies there now
-/// would crash the game.
+/// its middle. Only on the supported game build, and checked against the
+/// bytes too: on any other, the game itself is left alone (the overlay, hooked
+/// earlier, only shows that it needs an update), since hooking whatever lies
+/// there now would crash the game.
 fn hook_process_event() {
     let unsupported = |why: &str| {
         log::error!("main: {why}; the jukebox stays off on this game version");
+        UNSUPPORTED.store(true, Ordering::SeqCst);
         state::lock().error =
             Some("This version of the game isn't supported yet. Check for a jukebox update.".into());
     };
-    let Some((base, size)) = game_image() else {
+    let Some((base, size, stamp)) = game_image() else {
         return unsupported("could not find the game's image");
     };
+    if stamp != SUPPORTED_BUILD {
+        let why = format!("the game build is {stamp:#010X}, this jukebox was made for {SUPPORTED_BUILD:#010X}");
+        // Only by choice, in the settings file: the game's code is checked
+        // where the jukebox hooks it, but the rest of what it relies on
+        // (offsets into the game's objects) can't be, and may have moved.
+        if !state::lock().config.allow_untested_build {
+            return unsupported(&why);
+        }
+        log::warn!("main: {why}; running anyway (allow_untested_build), which may crash the game");
+        state::lock().notice = Some("Running on an untested game build (allow_untested_build): it may crash.".into());
+    }
     if sdk::config::PROCESS_EVENT + 0x90 > size {
         return unsupported("ProcessEvent lies outside the game's image");
     }
@@ -214,7 +267,9 @@ fn hook_process_event() {
             std::mem::forget(hook);
             log::info!("main: ProcessEvent hooked @ {process_event:p}");
         }
-        Err(e) => log::error!("main: could not hook ProcessEvent: {e}"),
+        // Without the hook nothing would ever play; the menu says so rather
+        // than looking like it works.
+        Err(e) => unsupported(&format!("could not hook ProcessEvent: {e}")),
     }
 }
 

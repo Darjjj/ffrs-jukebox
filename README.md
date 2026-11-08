@@ -32,6 +32,7 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
   music; only story scenes count as cutscenes.
 - **Favorites, playlists, hide and rename** any song, from a right-click menu.
 - **Play next** lines up one song to play after the current one, without losing your place in the list.
+  **Move up** and **Move down** reorder your lists from a song's + menu, controller included.
 - **Shuffle without repeats** (battle music has a Shuffle of its own), a one-click **repeat** button (off, playlist, song), **crossfade** between songs, and **resume** the last
   song where you left it when the game starts.
 - **Mini player** for while you explore, with volume on the mouse wheel. It can hide itself during
@@ -57,6 +58,11 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
 
 - FINAL FANTASY RESONANCE (Steam, Windows). Everything else is in the zip, including the ASI loader
   ([Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)) that loads the jukebox.
+- Each jukebox version is made for one build of the game. After a game update, the jukebox stays off and
+  its menu says so until a jukebox update for the new build is out. If you'd rather try your luck, set
+  `allow_untested_build = true` in `ffrs_jukebox.toml`: the jukebox then runs when the game's code still
+  looks the same where it hooks in, with a warning in the menu. It can crash the game on a build that
+  changed more than that, so it's off by default.
 
 ## Install
 
@@ -86,15 +92,21 @@ own music) from `scripts\`. If no other mod uses the ASI loader, also delete `wi
 | **Hold LT + right stick** | Move the menu or the mini player |
 | **In the menu, by controller** | D-pad or left stick to move, A to choose, B to back out |
 
-Every key can be changed in the menu's ⚙ settings (Controls tab). The General and Battles tabs hold
-crossfade length, resume, the mini player, boss music, the victory fanfare and the battle popup. Hotkeys do nothing while you are typing in a text box, and only work while the game is the
-active window.
+Every key can be changed in the menu's ⚙ settings (Controls tab). The General tab holds the crossfade
+length, how long looping game themes play, resuming at start, a new song on a new map, Vision shrines,
+the mini player and the key reminder; the Battles tab holds boss music, the victory fanfare, looping the
+battle song, picking up after battles and the battle popup. Hotkeys do nothing while you are typing in a
+text box, and only work while the game is the active window.
 
 - **Your own songs:** open the My Music tab and press **Open music folder**, add files, then **Rescan folder**.
 - **Right-click any song** to add it to a playlist, rename it or hide it. Hidden songs can be brought back
   from the Hidden tab.
 - **Play from** picks the list Next and Shuffle draw from; **Music for** picks a separate one for battles,
   the field, towns or dungeons. **Game themes** is the game's full-length songs without its short jingles.
+- **Heard in game:** the full menu shows the game's own song you heard last, with a star to add it to
+  Favorites.
+- **Greyed-out songs** wouldn't play earlier this session (hover one to see why). Next and Shuffle pass
+  them by; click one to try it again.
 - **Controller with extra buttons?** Back paddles, grip buttons and the like (Xbox Elite, DualSense Edge,
   Steam Deck, Steam Controller) can do it in one tap: with Steam Input on for the game (right-click it in
   your Steam library > Properties > Controller), bind a spare button to a jukebox key in the controller
@@ -106,7 +118,7 @@ active window.
   classics). The jukebox checks every song silently once per game version and leaves those out.
 - Pre-rendered movies with their own soundtrack (the opening, for one) pause the jukebox. Movies inside a
   battle (Vision attacks) play over the battle music, so your song carries on through them. In-engine
-  cutscenes are covered by the "Exploring, Battling, and Cutscenes" mode.
+  cutscenes get your music too if you turn on **Cutscenes** under "Play during".
 - While the combo's hold button (LT) is down, the game doesn't see the combo buttons or the right stick;
   LT itself still reaches the game.
 - Single-player only; nothing is sent anywhere.
@@ -114,12 +126,14 @@ active window.
 ## Troubleshooting
 
 `ffrs_jukebox.log` next to the `.asi` records what the jukebox does: the songs it found, what played, and
-any errors. Settings live in `ffrs_jukebox.toml`; if that file is ever damaged, the old one is kept as
-`ffrs_jukebox.toml.bad` before defaults are written.
+any errors. Settings live in `ffrs_jukebox.toml`; edit it with the game closed, since the jukebox writes
+it while the game runs. A wrong value in it goes back to its default and the rest is kept (the log says
+which); if the file isn't readable as settings at all, it's kept as `ffrs_jukebox.toml.bad` before
+defaults are written.
 
 ## Building from source
 
-Needs Rust (stable, MSVC toolchain) on Windows.
+Needs Rust 1.88 or newer (stable, MSVC toolchain) on Windows.
 
 ```
 git clone --recursive https://github.com/Darjjj/ffrs-jukebox
@@ -128,6 +142,15 @@ cargo build --release
 ```
 
 The build is `target\release\ffrs_jukebox.dll`; rename it to `ffrs_jukebox.asi`.
+
+For a build to give to others, keep your own folders out of its debug paths and let `tools\package.py`
+make the zip (it refuses a build that has them, or that's older than the sources):
+
+```powershell
+$env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE=~ --remap-path-prefix=$PWD=ffrs-jukebox"
+cargo build --release
+python tools\package.py
+```
 
 ## Credits
 

@@ -2,7 +2,8 @@
 //! The menu only reads it and queues [`Command`]s; the player is the only side
 //! that touches audio or the game.
 
-use std::collections::{HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -101,8 +102,10 @@ pub struct Shared {
     /// Songs that would not play this session (a cue the game cut off, a
     /// file that would not decode), by track key: skipped like unplayable
     /// ones, but never written to the config. Only the song check decides
-    /// what is unplayable for good. Files are tried again on a rescan.
-    pub skipped: HashSet<String>,
+    /// what is unplayable for good. Files are tried again on a rescan. Each
+    /// with why, shown on the song: it stays in the lists, greyed out, and
+    /// a click tries it again.
+    pub skipped: HashMap<String, String>,
     /// The last game song heard while the game had the music (the jukebox
     /// stopped, paused or stepping aside), by track key, so it can be
     /// favorited after the moment has passed.
@@ -130,18 +133,41 @@ pub struct Shared {
     /// Songs checked so far, and in all, while the song check runs.
     pub check_progress: Option<(usize, usize)>,
     pub error: Option<String>,
+    /// A standing warning shown under the controls, kept for the session
+    /// (running on a game build the jukebox wasn't checked against).
+    pub notice: Option<String>,
+    /// Bumped whenever the song lists change (songs, favorites, hidden,
+    /// playlists, titles, skips): the menu keeps its rows until it moves.
+    pub lists_rev: u64,
     /// The song lined up with Play next, by key: it plays at the next change
     /// of song while exploring, then the list carries on where it was.
     pub up_next: Option<String>,
     /// The music folder's folders and how many songs each holds, worked out
     /// when the files change rather than every frame the menu draws.
     pub folders: Vec<(String, usize)>,
+    /// Each song's place by key, for the number of songs it was built for:
+    /// looking songs up by key (playlists, every tick) without searching the
+    /// whole list each time. Rebuilt when the list changes.
+    pub(crate) index: RefCell<(usize, HashMap<String, usize>)>,
 }
 
 impl Shared {
     /// Puts `files` in place of your own files (they come first, the game's
     /// songs after) and works out the folders again.
+    /// Notes that the song lists changed (see `lists_rev`).
+    pub fn changed(&mut self) {
+        self.lists_rev = self.lists_rev.wrapping_add(1);
+    }
+
+    /// Whether `list` has nothing in it at all.
+    pub fn list_is_empty(&self, list: List) -> bool {
+        self.keys(list).is_empty()
+    }
+
     pub fn set_files(&mut self, files: Vec<Track>) {
+        self.changed();
+        // The same number of songs can still be different songs.
+        self.index.borrow_mut().0 = usize::MAX;
         let game: Vec<_> = self.tracks.drain(..).filter(|t| t.is_game()).collect();
         self.tracks = files;
         self.tracks.extend(game);
@@ -167,8 +193,12 @@ impl Shared {
         }
     }
 
+    /// Queues a command for the player. On a game build the jukebox doesn't
+    /// support, the player never runs, so nothing is queued.
     pub fn push(&mut self, command: Command) {
-        self.commands.push_back(command);
+        if !crate::UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+            self.commands.push_back(command);
+        }
     }
 
     /// Queues the config for writing on the writer thread: the menu and the
@@ -199,6 +229,7 @@ impl Shared {
 
     /// Adds song `i` to `list`, or takes it out if it is already there.
     pub fn toggle(&mut self, list: List, i: usize) {
+        self.changed();
         let Some(key) = self.tracks.get(i).map(|t| t.key.clone()) else { return };
         let Some(keys) = self.keys_mut(list) else { return };
         match keys.iter().position(|k| *k == key) {
@@ -213,6 +244,7 @@ impl Shared {
     /// Moves song `from` to where song `to` is in `list`, for drag and drop;
     /// the songs between shift along by one.
     pub fn move_to(&mut self, list: List, from: usize, to: usize) {
+        self.changed();
         let (Some(a), Some(b)) = (self.tracks.get(from), self.tracks.get(to)) else { return };
         let (a, b) = (a.key.clone(), b.key.clone());
         let Some(keys) = self.keys_mut(list) else { return };
@@ -229,6 +261,7 @@ impl Shared {
     /// `list`'s songs in play order, as track indices. A song that is
     /// missing (a deleted file, game songs not listed yet, or a game song
     /// with no audio) is skipped.
+    #[cfg(test)]
     pub fn indices(&self, list: List) -> Vec<usize> {
         self.indices_all(list).into_iter().filter(|&i| !self.is_unplayable(i)).collect()
     }
@@ -236,7 +269,7 @@ impl Shared {
     /// [`indices`](Self::indices), keeping songs that will not play too:
     /// the Hidden tab lists those as well, so they can still be unhidden.
     pub fn indices_all(&self, list: List) -> Vec<usize> {
-        self.keys(list).iter().filter_map(|k| self.tracks.iter().position(|t| t.key == *k)).collect()
+        self.keys(list).iter().filter_map(|k| self.index_of(k)).collect()
     }
 
     pub fn find_playlist(&self, name: &str) -> Option<usize> {
@@ -259,6 +292,7 @@ impl Shared {
 
     /// Makes an empty playlist and returns its index.
     pub fn create_playlist(&mut self, name: &str) -> usize {
+        self.changed();
         let name = self.unique_name(name);
         self.config.playlists.push(CustomPlaylist { name, tracks: Vec::new() });
         self.save_config();
@@ -266,6 +300,7 @@ impl Shared {
     }
 
     pub fn rename_playlist(&mut self, p: usize, name: &str) {
+        self.changed();
         let Some(old) = self.config.playlists.get(p).map(|p| p.name.clone()) else { return };
         if old == name.trim() {
             return;
@@ -289,6 +324,7 @@ impl Shared {
     }
 
     pub fn delete_playlist(&mut self, p: usize) {
+        self.changed();
         if p >= self.config.playlists.len() {
             return;
         }
@@ -308,9 +344,8 @@ impl Shared {
         self.save_config();
     }
 
-    /// The folders inside the music folder that hold songs, by name, each
-    /// one a playlist of its own.
-    /// The music folder's folders with how many songs each holds.
+    /// The folders inside the music folder that hold songs, each one a
+    /// playlist of its own: by name, with how many songs each holds.
     pub fn folders(&self) -> &[(String, usize)] {
         &self.folders
     }
@@ -327,6 +362,7 @@ impl Shared {
 
     /// Gives song `i` your own name, or its default one back with `None`.
     pub fn rename_track(&mut self, i: usize, name: Option<&str>) {
+        self.changed();
         let Some(track) = self.tracks.get(i) else { return };
         let name = name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
         match &track.source {
@@ -351,7 +387,21 @@ impl Shared {
 
     /// The track with `key`, by its place in the song list now.
     pub fn index_of(&self, key: &str) -> Option<usize> {
-        self.tracks.iter().position(|t| t.key == key)
+        let mut index = self.index.borrow_mut();
+        let found = |map: &HashMap<String, usize>| {
+            map.get(key).copied().filter(|&i| self.tracks.get(i).is_some_and(|t| t.key == key))
+        };
+        if index.0 == self.tracks.len() {
+            match (found(&index.1), index.1.contains_key(key)) {
+                (Some(i), _) => return Some(i),
+                (None, false) => return None,
+                // Listed at a place that holds another song now: rebuilt.
+                (None, true) => {}
+            }
+        }
+        index.1 = self.tracks.iter().enumerate().map(|(i, t)| (t.key.clone(), i)).collect();
+        index.0 = self.tracks.len();
+        found(&index.1)
     }
 
     pub fn is_renamed(&self, i: usize) -> bool {
@@ -384,8 +434,9 @@ impl Shared {
         self.songs_of(&self.config.playlist, keep)
     }
 
-    /// The songs of `which`, as [`playlist_keeping`](Self::playlist_keeping)
-    /// gives them for "Play from"; also used for the battle music.
+    /// The songs of `which` in play order, leaving out the ones that won't
+    /// play except `keep` (the song playing or just failed, so the list goes
+    /// on after it); also used for the battle and area music.
     pub fn songs_of(&self, which: &Playlist, keep: Option<usize>) -> Vec<usize> {
         if let Some(songs) = self.songs_of_only(which, keep) {
             return songs;
@@ -403,14 +454,16 @@ impl Shared {
     /// run empty can fall back to "Play from" rather than to every song.
     pub fn songs_of_only(&self, which: &Playlist, keep: Option<usize>) -> Option<Vec<usize>> {
         let playable = |i: &usize| Some(*i) == keep || !self.is_unplayable(*i);
+        // Skipped songs are left out once, below, so `keep` (the song that
+        // just failed) keeps its place and the list goes on after it.
         let chosen: Vec<usize> = match which {
             Playlist::AllSongs => return None,
-            Playlist::Favorites => self.indices(List::Favorites),
+            Playlist::Favorites => self.indices_all(List::Favorites),
             // Like All songs, hidden songs stay out.
             Playlist::GameThemes => (0..self.tracks.len())
                 .filter(|&i| self.tracks[i].is_game_loop() && !self.contains(List::Hidden, i))
                 .collect(),
-            Playlist::Custom(name) => self.indices(List::Custom(self.find_playlist(name)?)),
+            Playlist::Custom(name) => self.indices_all(List::Custom(self.find_playlist(name)?)),
             Playlist::Folder(name) => {
                 let prefix = format!("file:{name}/");
                 (0..self.tracks.len()).filter(|&i| self.tracks[i].key.starts_with(&prefix)).collect()
@@ -420,22 +473,67 @@ impl Shared {
         (!songs.is_empty()).then_some(songs)
     }
 
+    /// Whether `which` has any playable song, as `songs_of_only(which,
+    /// None).is_some()` but without building the list: asked every tick.
+    pub fn has_songs(&self, which: &Playlist) -> bool {
+        let playable = |i: usize| !self.is_unplayable(i);
+        match which {
+            Playlist::AllSongs => false,
+            Playlist::Favorites => self.keys(List::Favorites).iter().filter_map(|k| self.index_of(k)).any(playable),
+            Playlist::GameThemes => (0..self.tracks.len())
+                .any(|i| self.tracks[i].is_game_loop() && !self.contains(List::Hidden, i) && playable(i)),
+            Playlist::Custom(name) => self.find_playlist(name).is_some_and(|p| {
+                self.keys(List::Custom(p)).iter().filter_map(|k| self.index_of(k)).any(playable)
+            }),
+            Playlist::Folder(name) => self.tracks.iter().enumerate().any(|(i, t)| {
+                t.key.strip_prefix("file:").and_then(|k| k.strip_prefix(name.as_str())).is_some_and(|k| k.starts_with('/'))
+                    && playable(i)
+            }),
+        }
+    }
+
     pub fn is_unplayable_key(&self, key: &str) -> bool {
-        self.config.unplayable.iter().any(|k| k == key) || self.skipped.contains(key)
+        self.is_silent_key(key) || self.skipped.contains_key(key)
+    }
+
+    /// Found by the song check to have no audio at all (for good, on this
+    /// game build), unlike a song only skipped this session.
+    fn is_silent_key(&self, key: &str) -> bool {
+        self.config.unplayable.iter().any(|k| k == key)
+    }
+
+    pub fn is_silent(&self, i: usize) -> bool {
+        self.tracks.get(i).is_some_and(|t| self.is_silent_key(&t.key))
+    }
+
+    /// Why song `i` was skipped this session, if it was.
+    pub fn skip_reason(&self, i: usize) -> Option<&str> {
+        self.tracks.get(i).and_then(|t| self.skipped.get(&t.key)).map(String::as_str)
+    }
+
+    /// `list`'s songs as the menu lists them: songs skipped this session stay
+    /// (greyed out, to try again), songs with no audio at all don't.
+    pub fn indices_shown(&self, list: List) -> Vec<usize> {
+        self.indices_all(list).into_iter().filter(|&i| !self.is_silent(i)).collect()
     }
 
     pub fn is_unplayable(&self, i: usize) -> bool {
         self.tracks.get(i).is_some_and(|t| self.is_unplayable_key(&t.key))
     }
 
-    /// Skips song `i` for the rest of the session (it would not play), or
-    /// lets it play again. Nothing is written to the config.
-    pub fn set_skipped(&mut self, i: usize, skipped: bool) {
+    /// Skips song `i` for the rest of the session (it would not play), with
+    /// why. Nothing is written to the config.
+    pub fn skip(&mut self, i: usize, why: impl Into<String>) {
+        self.changed();
         let Some(key) = self.tracks.get(i).map(|t| t.key.clone()) else { return };
-        if skipped {
-            self.skipped.insert(key);
-        } else {
-            self.skipped.remove(&key);
+        self.skipped.insert(key, why.into());
+    }
+
+    /// Lets a skipped song play again.
+    pub fn unskip(&mut self, i: usize) {
+        self.changed();
+        if let Some(t) = self.tracks.get(i) {
+            self.skipped.remove(&t.key);
         }
     }
 
@@ -448,6 +546,7 @@ impl Shared {
 
     /// [`set_unplayable`](Self::set_unplayable) by track key.
     pub fn set_unplayable_key(&mut self, key: &str, unplayable: bool) {
+        self.changed();
         if !unplayable {
             self.skipped.remove(key);
         }
@@ -463,6 +562,7 @@ impl Shared {
     }
 
     pub fn unhide_all(&mut self) {
+        self.changed();
         self.config.hidden.clear();
         self.save_config();
     }
@@ -598,15 +698,18 @@ mod tests {
     fn a_skipped_song_leaves_the_lists_for_the_session_only() {
         let mut s = shared();
         s.toggle(List::Favorites, 1);
-        s.set_skipped(1, true);
+        s.skip(1, "Could not decode");
         assert!(s.is_unplayable(1));
         assert_eq!(s.indices(List::Favorites), Vec::<usize>::new());
+        // The menu still lists it, with why, so it can be tried again.
+        assert_eq!(s.indices_shown(List::Favorites), vec![1]);
+        assert_eq!(s.skip_reason(1), Some("Could not decode"));
         assert!(s.config.unplayable.is_empty(), "skipping must not touch the config");
         // The check finding it playing clears the skip.
         s.set_unplayable(1, false);
         assert!(!s.is_unplayable(1));
         // A list that has nothing playable is empty, not everything.
-        s.set_skipped(1, true);
+        s.skip(1, "Could not decode");
         assert_eq!(s.songs_of_only(&Playlist::Favorites, None), None);
         assert_eq!(s.songs_of(&Playlist::Favorites, None), vec![0, 2]);
         // The Hidden tab still lists a skipped song, so it can be unhidden.
@@ -648,5 +751,79 @@ mod tests {
         s.toggle(List::Hidden, 2);
         assert_eq!(s.songs_of(&Playlist::GameThemes, None), vec![1, 3]);
         assert!(s.play_from_choices().contains(&Playlist::GameThemes));
+    }
+
+    #[test]
+    fn song_lookup_follows_every_change_to_the_list() {
+        let file = |rel: &str| Track {
+            title: rel.into(),
+            base_title: rel.into(),
+            key: format!("file:{rel}"),
+            source: Source::File(rel.into()),
+        };
+        let mut s = shared();
+        s.set_files(vec![file("a.mp3"), file("b.mp3")]);
+        assert_eq!(s.index_of("file:b.mp3"), Some(1));
+        // The same number of files, one renamed on disk.
+        s.set_files(vec![file("a.mp3"), file("c.mp3")]);
+        assert_eq!(s.index_of("file:b.mp3"), None);
+        assert_eq!(s.index_of("file:c.mp3"), Some(1));
+        // Songs added straight to the list, in front.
+        s.tracks.insert(0, file("first.mp3"));
+        assert_eq!(s.index_of("file:c.mp3"), Some(2));
+        assert_eq!(s.index_of("file:first.mp3"), Some(0));
+    }
+
+    #[test]
+    fn a_failed_song_in_a_playlist_hands_on_to_the_one_after_it() {
+        let mut s = shared();
+        let p = s.create_playlist("Mine");
+        for i in 0..3 {
+            s.toggle(List::Favorites, i);
+            s.toggle(List::Custom(p), i);
+        }
+        s.skip(1, "Could not decode");
+        // The failed song keeps its place, so the list goes on after it...
+        for list in [Playlist::Favorites, Playlist::Custom("Mine".into())] {
+            assert_eq!(s.songs_of(&list, Some(1)), vec![0, 1, 2]);
+            // ...and is passed over otherwise.
+            assert_eq!(s.songs_of(&list, None), vec![0, 2]);
+        }
+    }
+
+    #[test]
+    fn the_quick_check_for_songs_agrees_with_the_full_list() {
+        let mut s = shared();
+        let file = |rel: &str| Track {
+            title: rel.into(),
+            base_title: rel.into(),
+            key: format!("file:{rel}"),
+            source: Source::File(rel.into()),
+        };
+        s.set_files(vec![file("Chill/a.mp3"), file("Chillout/b.mp3")]);
+        let p = s.create_playlist("Mine");
+        s.toggle(List::Custom(p), 3);
+        s.toggle(List::Favorites, 0);
+        let lists = [
+            Playlist::Favorites,
+            Playlist::GameThemes,
+            Playlist::Custom("Mine".into()),
+            Playlist::Custom("Gone".into()),
+            Playlist::Folder("Chill".into()),
+            Playlist::Folder("Chillout".into()),
+            Playlist::Folder("Nope".into()),
+        ];
+        let agree = |s: &Shared| {
+            for list in &lists {
+                assert_eq!(s.has_songs(list), s.songs_of_only(list, None).is_some(), "{list:?}");
+            }
+        };
+        agree(&s);
+        // A folder's only song skipped, a playlist's only song with no audio.
+        s.skip(0, "Could not decode");
+        s.set_unplayable(3, true);
+        agree(&s);
+        assert!(!s.has_songs(&Playlist::Folder("Chill".into())));
+        assert!(s.has_songs(&Playlist::Folder("Chillout".into())));
     }
 }

@@ -1,6 +1,6 @@
-//! Everything that talks to the game. Runs on the game thread from a hook at
-//! the entry of `UObject::ProcessEvent`, throttled to [`TICK_MS`], because
-//! UFunctions may only be called from there.
+//! Everything that talks to the game. Runs on the game thread from a hook
+//! inside `UObject::ProcessEvent` (see `hook_process_event`), throttled to
+//! [`TICK_MS`], because UFunctions may only be called from there.
 
 use std::collections::HashMap;
 use std::ptr::null_mut;
@@ -69,7 +69,13 @@ fn tick() {
         player.tick(&mut Game::get());
     });
     let took = started.elapsed();
-    if took > SLOW_TICK {
+    // Logged at most once a second: a load can make every tick slow for a
+    // while, and a line each would be its own small cost on this thread.
+    thread_local! {
+        static LAST_SLOW: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    }
+    if took > SLOW_TICK && LAST_SLOW.get().is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+        LAST_SLOW.set(Some(std::time::Instant::now()));
         let (scan, scene) = TIMES.get();
         log::warn!(
             "tick: slow, {:.1} ms (object scan {:.1}, scene {:.1}, the rest {:.1}; {} objects)",
@@ -151,8 +157,15 @@ struct Watch {
     next_text_boxes: Vec<(i32, usize)>,
     pos: i32,
     /// What each class seen so far is: a few thousand classes, against
-    /// hundreds of thousands of objects.
-    kinds: HashMap<usize, Kind>,
+    /// hundreds of thousands of objects. Keyed by the class's address and
+    /// its name, so a class freed on a level change and another allocated
+    /// where it was doesn't pass for it.
+    kinds: HashMap<(usize, i32), Kind>,
+}
+
+/// A class's place in the kinds cache.
+fn class_key(class: *mut sdk::config::UClass) -> (usize, i32) {
+    (class as usize, unsafe { (*class.cast::<sdk::config::UObject>()).Name.ComparisonIndex })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -204,7 +217,7 @@ fn watch_step(w: &mut Watch) {
         if o.Class.is_null() || o.IsDefaultObject() {
             continue;
         }
-        let kind = *w.kinds.entry(o.Class as usize).or_insert_with(|| kind_of(o.Class));
+        let kind = *w.kinds.entry(class_key(o.Class)).or_insert_with(|| kind_of(o.Class));
         match kind {
             Kind::Player => w.next_players.push((index, obj as usize)),
             Kind::TextBox => w.next_text_boxes.push((index, obj as usize)),
@@ -219,8 +232,20 @@ fn watch_step(w: &mut Watch) {
     }
 }
 
-fn alive(&(index, ptr): &(i32, usize)) -> bool {
-    rt::GObjects.GetByIndex(index) as usize == ptr
+/// Whether a watched object is still the one found, and still what it was
+/// taken for: its slot holds it, it isn't being destroyed, and its class is
+/// still a `want`. The lists are up to a pass behind, and the game can free
+/// an object and put another where it was in that time.
+fn alive(w: &Watch, &(index, ptr): &(i32, usize), want: Kind) -> bool {
+    if rt::GObjects.GetByIndex(index) as usize != ptr {
+        return false;
+    }
+    let o = unsafe { &*(ptr as *const sdk::config::UObject) };
+    let destroying = rt::EObjectFlags::BeginDestroyed.0 | rt::EObjectFlags::FinishDestroyed.0;
+    if o.Flags.0 & destroying != 0 || o.Class.is_null() {
+        return false;
+    }
+    w.kinds.get(&class_key(o.Class)) == Some(&want)
 }
 
 /// Set each tick: one of the game's text boxes has the keyboard.
@@ -232,11 +257,11 @@ fn watch() -> bool {
     let mut guard = WATCH.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.get_or_insert_with(Watch::default);
     watch_step(w);
-    let typing = w.text_boxes.iter().filter(|e| alive(e)).any(|&(_, ptr)| {
+    let typing = w.text_boxes.iter().filter(|e| alive(w, e, Kind::TextBox)).any(|&(_, ptr)| {
         unsafe { &mut *(ptr as *mut UWidget) }.HasKeyboardFocus()
     });
     GAME_TYPING.store(typing, Ordering::Relaxed);
-    w.players.iter().filter(|e| alive(e)).any(|&(_, ptr)| {
+    w.players.iter().filter(|e| alive(w, e, Kind::Player)).any(|&(_, ptr)| {
         let player = unsafe { &mut *(ptr as *mut UManaPlayer) };
         player.IsPlaying() && unsafe { player.ManaMovie.as_ref() }.is_some_and(|m| m.AudioTracks.Num() > 0)
     })
@@ -438,8 +463,18 @@ impl Game {
         Some((area, data.MapType == EeMapType::VisionSmallShrine))
     }
 
+    /// The BGM cue sheet's name. The game hands it back as a string it
+    /// allocates and never frees, so it's asked once and kept.
     fn bgm_sheet_name() -> String {
-        UCPP_SoundManager::GetCueSheetNameBGM().ToString()
+        static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        if let Some(name) = NAME.get() {
+            return name.clone();
+        }
+        let name = UCPP_SoundManager::GetCueSheetNameBGM().ToString();
+        if !name.is_empty() {
+            let _ = NAME.set(name.clone());
+        }
+        name
     }
 
     fn bgm_sheet(&mut self) -> *mut USoundAtomCueSheet {
@@ -509,14 +544,26 @@ impl Game {
         }
     }
 
-    pub fn play_cue(&mut self, cue: &str, start: f32) -> Option<i32> {
+    /// Starts `cue` `start` seconds in. Returns its play id and how far the
+    /// start was wound back: a looping theme's time keeps counting past the
+    /// end of its audio as it loops, so a place saved from it (for resuming,
+    /// after a battle, a seek) can lie beyond its audio, and started there
+    /// the game's sound engine plays a loud buzz. Such a place is wrapped
+    /// back inside the audio, and the player adds the difference to the
+    /// song's time so its position reads as it did.
+    pub fn play_cue(&mut self, cue: &str, start: f32) -> Option<(i32, f32)> {
         let mut sheet = FAllocatedString::from(Self::bgm_sheet_name().as_str());
-        let mut cue = FAllocatedString::from(cue);
+        let mut name = FAllocatedString::from(cue);
+        let wave = self.sm()?.GetFirstWaveDuration(&sheet.Get(), &name.Get());
+        let wound = if wave > 1.0 && start >= wave { start - start % wave } else { 0.0 };
+        if wound > 0.0 {
+            log::debug!("game: {cue} start {start:.1}s is past its audio ({wave:.1}s), starting at {:.1}s", start - wound);
+        }
         let mut param: FPLAY_SOUND_PARAMETER = unsafe { std::mem::zeroed() };
-        param.startTime = start;
+        param.startTime = start - wound;
         param.isPersistAcrossLevelTransition = true;
-        let id = self.sm()?.PlaySound2D(&sheet.Get(), &cue.Get(), &param);
-        (id >= 0).then_some(id)
+        let id = self.sm()?.PlaySound2D(&sheet.Get(), &name.Get(), &param);
+        (id >= 0).then_some((id, wound))
     }
 
     pub fn exists(&mut self, id: i32) -> bool {
@@ -618,9 +665,11 @@ pub struct BgmMute {
 }
 
 impl BgmMute {
-    pub fn hold(&mut self, game: &mut Game, own: Option<i32>) {
+    /// Mutes the game's current BGM, unless it's one of the jukebox's own
+    /// sounds (`own`): the song it plays, or the song check's silent probe.
+    pub fn hold(&mut self, game: &mut Game, own: [Option<i32>; 2]) {
         let Some(id) = game.current_bgm() else { return };
-        if Some(id) == own {
+        if own.contains(&Some(id)) {
             return;
         }
         if let std::collections::hash_map::Entry::Vacant(slot) = self.muted.entry(id) {
@@ -658,6 +707,7 @@ pub fn refresh_game_tracks(game: &mut Game) {
             return;
         }
         let mut s = state::lock();
+        s.changed();
         s.tracks.extend(songs);
         s.apply_titles();
         s.game_tracks_ready = true;

@@ -48,14 +48,30 @@ pub fn ensure_measured(path: &Path, key: &str) {
     }
     // One measurement per file at a time, however often it is replayed, and
     // two at most in all: skipping through new files doesn't start a decoder
-    // for each. One left out is measured the next time it plays.
+    // for each. One left out is measured the next time it plays; one that
+    // couldn't be measured (silence, a file that won't decode) isn't decoded
+    // again every play.
     let mut measuring = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
-    if measuring.len() < MAX_MEASURING && measuring.insert(key.to_string()) {
+    if measuring.failed.contains(key) {
+        return;
+    }
+    if measuring.now.len() < MAX_MEASURING && measuring.now.insert(key.to_string()) {
         drop(measuring);
         let (path, key) = (path.to_path_buf(), key.to_string());
         std::thread::spawn(move || {
-            measure_and_store(&path, &key);
-            MEASURING.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            // The slot is given back however the measurement ends, a panic
+            // in the decoder included, or two bad files would stop every
+            // measurement for the session.
+            struct Slot(String);
+            impl Drop for Slot {
+                fn drop(&mut self) {
+                    MEASURING.lock().unwrap_or_else(|e| e.into_inner()).now.remove(&self.0);
+                }
+            }
+            let _slot = Slot(key.clone());
+            if !measure_and_store(&path, &key) {
+                MEASURING.lock().unwrap_or_else(|e| e.into_inner()).failed.insert(key);
+            }
         });
     }
 }
@@ -66,10 +82,18 @@ pub fn saved(key: &str) -> (Option<f32>, Option<f32>) {
     (s.config.file_levels.get(key).copied(), s.config.file_peaks.get(key).copied())
 }
 
-static MEASURING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// Files being measured right now, and those that couldn't be this session.
+#[derive(Default)]
+struct Measuring {
+    now: BTreeSet<String>,
+    failed: BTreeSet<String>,
+}
+
+static MEASURING: Mutex<Measuring> = Mutex::new(Measuring { now: BTreeSet::new(), failed: BTreeSet::new() });
 const MAX_MEASURING: usize = 2;
 
-fn measure_and_store(path: &Path, key: &str) {
+/// Measures the file and saves its gain and peak. False if it couldn't be.
+fn measure_and_store(path: &Path, key: &str) -> bool {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match measure(path) {
         Some((db, peak)) => {
@@ -79,8 +103,12 @@ fn measure_and_store(path: &Path, key: &str) {
             s.config.file_levels.insert(key.to_string(), gain);
             s.config.file_peaks.insert(key.to_string(), peak);
             s.save_config();
+            true
         }
-        None => log::warn!("loudness: could not measure {name}"),
+        None => {
+            log::warn!("loudness: could not measure {name}");
+            false
+        }
     }
 }
 

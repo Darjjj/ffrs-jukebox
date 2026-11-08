@@ -1,4 +1,31 @@
-# Changelog
+﻿# Changelog
+
+## 1.8.0 - 2026-11-07
+
+- New: a song that wouldn't play stays in your lists, greyed out, with why on hover. Click it to try it
+  again. Play next on one gives it another try too.
+- New: Move up and Move down in a song's + menu, for reordering Favorites and your playlists with a
+  controller. The menu stays open and follows the song as you move it.
+- The jukebox now runs only on the game build it was made for. On any other it leaves the game alone
+  and its menu says it needs an update, instead of risking a crash. The impatient can set
+  `allow_untested_build = true` in the settings file to run it anyway, at their own risk.
+- Fixed a loud buzz when a looping game theme was picked up past the end of its audio, at game start or
+  after a battle. Seeking, in game themes and in your own songs, is clean and keeps its place.
+- Pausing holds in every case: as a song ends, when a song fails, during a crossfade, through a battle;
+  and it silences anything still fading out.
+- Your own music comes back by itself when the game's window reappears or the sound device changes,
+  instead of playing on in silence with the game's music muted.
+- Shuffle keeps its place when a list changes, and with Repeat off it ends once every song has had
+  its turn. Play next keeps your place through a battle with its own battle music.
+- Settings are safer: a settings file that's briefly locked, or has one wrong value in it, is no longer
+  reset to defaults; a damaged file's backup is never overwritten; the last change and the song to
+  resume are saved as the game closes.
+- The silent song check runs only while exploring, so a loading map or a scene can't mark a song as
+  having no audio, and it no longer interferes with the game's own music.
+- Smoother all round: far less work each frame with a big music library, a lighter load on the game
+  while it plays, crossfades matched to short songs, and no pile-ups on slow drives.
+- Many smaller fixes in the menu: controller navigation, key rebinding, titles with accented letters or
+  curly quotes, folder pages, sliders, and the key reminder.
 
 ## 1.7.1 - 2026-11-06
 

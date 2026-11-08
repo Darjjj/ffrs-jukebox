@@ -32,6 +32,12 @@ pub const CLOSE_SMALL: &str = "\u{2715}";
 /// The symbols above, from Segoe UI Symbol.
 static SYMBOLS: [u32; 9] = [0x2190, 0x23FF, 0x25A0, 0x25FF, 0x2600, 0x26FF, 0x2700, 0x27BF, 0];
 
+/// What the text fonts cover: Latin with its accents and extensions (Polish,
+/// Czech, Turkish, Vietnamese), Greek, Cyrillic, and the typographic
+/// punctuation song titles carry (curly quotes, dashes, the ellipsis).
+/// imgui's default range stops at U+00FF and showed the rest as "?".
+static TEXT: [u32; 11] = [0x0020, 0x024F, 0x0370, 0x03FF, 0x0400, 0x04FF, 0x1E00, 0x1EFF, 0x2000, 0x206F, 0];
+
 pub struct Fonts {
     pub heading: Option<FontId>,
     /// The now-playing song title, and the transport icons.
@@ -52,12 +58,19 @@ fn read(name: &str) -> Option<&'static [u8]> {
 /// Windows fonts are missing.
 pub fn load_fonts(ctx: &mut Context, scale: f32) -> Fonts {
     let symbols = read("seguisym.ttf");
-    let mut add = |file: &str, size: f32| -> Option<FontId> {
-        let text = read(file)?;
+    // Each file read once, however many sizes it's used at.
+    let segoe = read("segoeui.ttf");
+    let pala = read("pala.ttf");
+    let mut add = |text: Option<&'static [u8]>, size: f32| -> Option<FontId> {
+        let text = text?;
         let mut sources = vec![FontSource::TtfData {
             data: text,
             size_pixels: size * scale,
-            config: Some(FontConfig { oversample_h: 2, ..FontConfig::default() }),
+            config: Some(FontConfig {
+                oversample_h: 2,
+                glyph_ranges: FontGlyphRanges::from_slice(&TEXT),
+                ..FontConfig::default()
+            }),
         }];
         if let Some(sym) = symbols {
             sources.push(FontSource::TtfData {
@@ -71,10 +84,10 @@ pub fn load_fonts(ctx: &mut Context, scale: f32) -> Fonts {
         }
         Some(ctx.fonts().add_font(&sources))
     };
-    let body = add("segoeui.ttf", 20.0);
-    let heading = add("pala.ttf", 34.0);
-    let song = add("pala.ttf", 26.0);
-    let small = add("segoeui.ttf", 16.5);
+    let body = add(segoe, 20.0);
+    let heading = add(pala, 34.0);
+    let song = add(pala, 26.0);
+    let small = add(segoe, 16.5);
     if body.is_none() {
         log::warn!("theme: Windows fonts not found, using the default font");
         ctx.io_mut().font_global_scale = scale;
@@ -147,12 +160,13 @@ pub fn apply(ctx: &mut Context, scale: f32) {
     c[StyleColor::NavHighlight as usize] = ACCENT;
 }
 
-/// The teal panel and its thin outline behind the current window, on the
-/// background layer so the window's contents sit on top.
+/// The teal panel and its thin outline behind the current window, drawn
+/// first on the window's own layer so its contents sit on top, and so a
+/// window dragged over another covers it.
 pub fn backdrop(ui: &Ui) {
     let [x, y] = ui.window_pos();
     let [w, h] = ui.window_size();
-    let draw = ui.get_background_draw_list();
+    let draw = ui.get_window_draw_list();
     draw.add_rect_filled_multicolor([x + 1.0, y + 1.0], [x + w - 1.0, y + h - 1.0], TOP, TOP, BOTTOM, BOTTOM);
     draw.add_rect([x, y], [x + w, y + h], LINE).rounding(3.0).thickness(1.2).build();
     // A second line just inside, like the double frames on the party cards.

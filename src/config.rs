@@ -112,7 +112,7 @@ impl Repeat {
 }
 
 /// Which songs Next and Shuffle pick from.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Default)]
 pub enum Playlist {
     #[default]
     AllSongs,
@@ -261,6 +261,12 @@ pub struct Config {
     pub mini_hide_while_talking: bool,
     /// Hide the reminder at the foot of the menu of which keys switch it.
     pub hide_key_hint: bool,
+    /// Run on a game build this jukebox wasn't made for, as long as the
+    /// game's code still looks the same where the jukebox hooks it. Off by
+    /// default: a build the jukebox hasn't been checked against can crash
+    /// the game. For testing whether a game update needs a jukebox update;
+    /// only in the settings file, not in the menu.
+    pub allow_untested_build: bool,
     /// Hold Left Trigger and press the D-pad: left previous, right next, up
     /// play/pause, down stop.
     pub controller: bool,
@@ -396,6 +402,7 @@ impl Default for Config {
             mini_hide_in_cutscenes: true,
             mini_hide_while_talking: false,
             hide_key_hint: false,
+            allow_untested_build: false,
             controller: true,
             pad_hold: PadButton::LT,
             pad_previous: PadButton::DpadLeft,
@@ -542,9 +549,78 @@ impl Bind {
     }
 }
 
+/// Whether settings are written back this session. Off when the file
+/// couldn't be read at start: it's probably fine and only locked, and
+/// saving defaults over it would lose everything in it.
+static PERSIST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether changes to the settings are being saved this session.
+pub fn persisting() -> bool {
+    PERSIST.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Work for the writer thread.
+enum Write {
+    Save(PathBuf, Config),
+    /// Write whatever is waiting now, and say when it's done.
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// The one thread that writes the settings file. A save waits 300 ms for
+/// more to arrive (a slider drag, the position saved every few seconds) and
+/// writes the latest, so a burst of changes is one write, and neither the
+/// menu nor the player waits on the disk.
+fn writer() -> &'static std::sync::mpsc::Sender<Write> {
+    static WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<Write>> = std::sync::OnceLock::new();
+    WRITER.get_or_init(|| {
+        use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
+        let (tx, rx) = std::sync::mpsc::channel::<Write>();
+        std::thread::spawn(move || {
+            let mut pending: Option<(PathBuf, Config)> = None;
+            loop {
+                let next = match &pending {
+                    Some(_) => rx.recv_timeout(std::time::Duration::from_millis(300)),
+                    None => rx.recv().map_err(|_| Disconnected),
+                };
+                match next {
+                    Ok(Write::Save(path, config)) => pending = Some((path, config)),
+                    Ok(Write::Flush(done)) => {
+                        if let Some((path, config)) = pending.take() {
+                            config.save(&path);
+                        }
+                        let _ = done.send(());
+                    }
+                    Err(Timeout) => {
+                        if let Some((path, config)) = pending.take() {
+                            config.save(&path);
+                        }
+                    }
+                    Err(Disconnected) => return,
+                }
+            }
+        });
+        tx
+    })
+}
+
+/// Writes any save still waiting, now, and waits up to `timeout` for it:
+/// for the game closing, when the writer thread would be cut off.
+pub fn flush(timeout: std::time::Duration) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    if writer().send(Write::Flush(done_tx)).is_ok() {
+        let _ = done_rx.recv_timeout(timeout);
+    }
+}
+
+/// `list` with each entry once, in its first place.
+fn dedupe(list: &mut Vec<String>) {
+    let mut seen = std::collections::BTreeSet::new();
+    list.retain(|k| seen.insert(k.clone()));
+}
+
 impl Config {
-    /// Where the jukebox plays, carried over from the older single choice
-    /// until the toggles are first changed.
+    /// Where the jukebox plays. A settings file from before the toggles has
+    /// its single choice moved into them when it's loaded (`sanitize`).
     pub fn play_in(&self) -> PlayIn {
         self.play_in.unwrap_or_else(|| self.mode.into())
     }
@@ -601,32 +677,138 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Self {
-        let parsed = match std::fs::read(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let config = Self::default();
-                config.save(path);
-                return config;
+        // Read with a few retries: an antivirus or a sync client can hold
+        // the file for a moment, and that must not look like a damaged file.
+        let mut bytes = Err(std::io::Error::other("not read"));
+        for attempt in 0..5 {
+            bytes = std::fs::read(path);
+            match &bytes {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let config = Self::default();
+                    config.save(path);
+                    return config;
+                }
+                Err(_) if attempt < 4 => std::thread::sleep(std::time::Duration::from_millis(100)),
+                _ => break,
             }
-            Err(e) => Err(format!("could not be read: {e}")),
-            // Notepad's "Unicode" saves UTF-16, which isn't TOML.
-            Ok(bytes) => String::from_utf8(bytes)
-                .map_err(|_| "isn't saved as UTF-8".to_string())
-                .and_then(|text| toml::from_str(&text).map_err(|e| format!("is invalid: {e}"))),
+        }
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            // Probably a fine file that can't be read right now: saving
+            // defaults over it would lose everything in it, so nothing is
+            // saved this session (the menu says so).
+            Err(e) => {
+                log::error!(
+                    "config: {} could not be read ({e}); using defaults, and not saving over it this session",
+                    path.display()
+                );
+                PERSIST.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Self::default();
+            }
         };
-        parsed.unwrap_or_else(|why| {
-            // Kept aside before anything is saved over it, so favorites,
-            // playlists and keys in a damaged file can still be recovered.
-            let backup = path.with_extension("toml.bad");
-            match std::fs::copy(path, &backup) {
-                Ok(_) => log::error!(
-                    "config: {} {why}; using defaults, the old file is kept as {}",
-                    path.display(),
-                    backup.display()
-                ),
-                Err(ce) => log::error!("config: {} {why}, and could not be backed up: {ce}", path.display()),
+        // Notepad's "Unicode" saves UTF-16, which isn't TOML.
+        let Ok(text) = String::from_utf8(bytes) else {
+            return Self::damaged(path, "isn't saved as UTF-8");
+        };
+        let table: toml::Table = match text.parse() {
+            Ok(table) => table,
+            Err(e) => return Self::damaged(path, &format!("is invalid: {e}")),
+        };
+        // Keys the jukebox doesn't know (a typo in a hand edit) are dropped
+        // by the next save, so they're at least named here.
+        let unknown = |path: serde_ignored::Path| {
+            log::warn!("config: `{path}` isn't a setting the jukebox knows, and won't be kept");
+        };
+        let mut config = match serde_ignored::deserialize(toml::Value::Table(table.clone()), unknown) {
+            Ok(config) => config,
+            Err(_) => Self::salvage(table),
+        };
+        config.sanitize();
+        config
+    }
+
+    /// A file with a wrong value somewhere (`repeat = "all"`, a key code
+    /// too big for a number): every setting that does read is kept, and
+    /// only the wrong ones go back to their defaults.
+    fn salvage(table: toml::Table) -> Self {
+        let mut kept = toml::Table::new();
+        for (key, value) in table {
+            let mut one = toml::Table::new();
+            one.insert(key.clone(), value.clone());
+            match one.try_into::<Self>() {
+                Ok(_) => {
+                    kept.insert(key, value);
+                }
+                Err(e) => log::error!("config: `{key}` is invalid and goes back to its default: {}", e.message()),
             }
-            Self::default()
-        })
+        }
+        kept.try_into().unwrap_or_default()
+    }
+
+    /// A file that isn't TOML at all: kept aside before anything is saved
+    /// over it, so favorites, playlists and keys in it can be recovered. An
+    /// earlier `.bad` is never overwritten.
+    fn damaged(path: &Path, why: &str) -> Self {
+        let backup = (0..10)
+            .map(|n| path.with_extension(if n == 0 { "toml.bad".to_string() } else { format!("toml.bad{n}") }))
+            .find(|p| !p.exists())
+            .unwrap_or_else(|| path.with_extension("toml.bad9"));
+        match std::fs::copy(path, &backup) {
+            Ok(_) => log::error!(
+                "config: {} {why}; using defaults, the old file is kept as {}",
+                path.display(),
+                backup.display()
+            ),
+            Err(ce) => log::error!("config: {} {why}, and could not be backed up: {ce}", path.display()),
+        }
+        Self::default()
+    }
+
+    /// Puts a loaded file right: hand-edited numbers back in range (a NaN or
+    /// an infinity would stall a fade or break a seek), and an older file's
+    /// single play mode turned into `play_in`, so it survives the next save
+    /// (the old `mode` field isn't written back).
+    fn sanitize(&mut self) {
+        let d = Self::default();
+        let fix = |v: &mut f32, lo: f32, hi: f32, default: f32| {
+            *v = if v.is_finite() { v.clamp(lo, hi) } else { default };
+        };
+        fix(&mut self.volume, 0.0, 1.5, d.volume);
+        fix(&mut self.ui_scale, 0.5, 4.0, d.ui_scale);
+        fix(&mut self.crossfade_secs, 0.0, 8.0, d.crossfade_secs);
+        fix(&mut self.loop_minutes, 1.0, 15.0, d.loop_minutes);
+        fix(&mut self.my_music_level_db, -12.0, 6.0, d.my_music_level_db);
+        if let Some((_, at)) = &mut self.last_song
+            && !(at.is_finite() && (0.0..=86_400.0).contains(at))
+        {
+            *at = 0.0;
+        }
+        self.file_levels.retain(|_, gain| gain.is_finite() && *gain > 0.0);
+        self.file_peaks.retain(|_, peak| peak.is_finite() && *peak > 0.0);
+        for spot in [&mut self.menu_pos, &mut self.menu_size, &mut self.settings_size, &mut self.mini_pos] {
+            if spot.is_some_and(|p| !p.iter().all(|v| v.is_finite())) {
+                *spot = None;
+            }
+        }
+        if self.play_in.is_none() {
+            self.play_in = Some(self.mode.into());
+        }
+        // A song listed twice in a hand-edited list would show twice and
+        // only half-remove; a playlist with no name or a name used twice
+        // can't be told apart in the menu.
+        dedupe(&mut self.favorites);
+        dedupe(&mut self.hidden);
+        let mut names: Vec<String> = Vec::new();
+        for (n, p) in self.playlists.iter_mut().enumerate() {
+            dedupe(&mut p.tracks);
+            if p.name.trim().is_empty() {
+                p.name = format!("Playlist {}", n + 1);
+            }
+            while names.contains(&p.name) {
+                p.name.push_str(" 2");
+            }
+            names.push(p.name.clone());
+        }
     }
 
     /// Hands a copy to the writer thread, which writes it after a short
@@ -634,37 +816,43 @@ impl Config {
     /// (a slider drag, the position saved every few seconds) is one write.
     /// Neither the menu nor the player waits on the disk this way.
     pub fn save_in_background(&self, path: &Path) {
-        use std::sync::mpsc::{Sender, channel};
-        static WRITER: std::sync::OnceLock<Sender<(PathBuf, Config)>> = std::sync::OnceLock::new();
-        let tx = WRITER.get_or_init(|| {
-            let (tx, rx) = channel::<(PathBuf, Config)>();
-            std::thread::spawn(move || {
-                while let Ok(first) = rx.recv() {
-                    let mut latest = first;
-                    while let Ok(next) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
-                        latest = next;
-                    }
-                    latest.1.save(&latest.0);
-                }
-            });
-            tx
-        });
-        if tx.send((path.to_path_buf(), self.clone())).is_err() {
+        if writer().send(Write::Save(path.to_path_buf(), self.clone())).is_err() {
             // The writer thread is gone; write here rather than lose it.
             self.save(path);
         }
     }
 
     /// Written to a temporary file and swapped in, so a crash mid-save can't
-    /// leave a half-written config behind.
+    /// leave a half-written config behind. Each save has a temporary file of
+    /// its own, so two saves in flight can't swap in each other's halves.
     pub fn save(&self, path: &Path) {
+        if !PERSIST.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let text = match toml::to_string_pretty(self) {
             Ok(text) => text,
             Err(e) => return log::error!("config: could not serialize: {e}"),
         };
-        let tmp = path.with_extension("toml.tmp");
-        if let Err(e) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)) {
+        static SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("toml.tmp{n}"));
+        if let Err(e) = std::fs::write(&tmp, text) {
+            log::error!("config: could not write {}: {e}", tmp.display());
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        // The swap is retried: a scanner may hold the file for a moment.
+        let mut swapped = std::fs::rename(&tmp, path);
+        for _ in 0..3 {
+            if swapped.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            swapped = std::fs::rename(&tmp, path);
+        }
+        if let Err(e) = swapped {
             log::error!("config: could not write {}: {e}", path.display());
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -819,5 +1007,33 @@ mod tests {
         assert_eq!(std::fs::read(path.with_extension("toml.bad")).unwrap(), bytes);
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "the file itself isn't saved over at load");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_play_mode_survives_a_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("ffrs_jukebox_mode_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ffrs_jukebox.toml");
+        std::fs::write(&path, "mode = \"ExploringAndBattles\"").unwrap();
+        let want = PlayIn { exploring: true, battles: true, cutscenes: false };
+        let config = Config::load(&path);
+        assert_eq!(config.play_in(), want);
+        config.save(&path);
+        assert_eq!(Config::load(&path).play_in(), want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hand_edited_numbers_are_put_back_in_range() {
+        let mut c: Config =
+            toml::from_str("crossfade_secs = inf
+volume = nan
+loop_minutes = 900.0
+last_song = [\"game:X\", inf]").unwrap();
+        c.sanitize();
+        assert_eq!(c.crossfade_secs, Config::default().crossfade_secs);
+        assert_eq!(c.volume, Config::default().volume);
+        assert_eq!(c.loop_minutes, 15.0);
+        assert_eq!(c.last_song, Some(("game:X".to_string(), 0.0)));
     }
 }

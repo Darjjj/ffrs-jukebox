@@ -74,6 +74,16 @@ impl KeyPoll {
         Self { down: [false; 256] }
     }
 
+    /// Takes in which of `watch` are down right now without reporting
+    /// them, so a key held as a rebinding starts isn't a fresh press.
+    pub fn prime(&mut self, watch: impl Iterator<Item = i32>) {
+        for vk in watch {
+            if (0..256).contains(&vk) {
+                self.down[vk as usize] = held(vk);
+            }
+        }
+    }
+
     /// The keys among `watch` pressed since the last call, in the order
     /// given. Only the bound keys are asked about each frame; every key
     /// (see [`ALL_KEYS`]) only while one is being rebound.

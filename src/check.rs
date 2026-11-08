@@ -1,9 +1,11 @@
 //! A silent pass over every game song, finding the ones with no audio in the
 //! game's files. Each song is started at zero volume and counts as playable
 //! once its position moves; one that is cut off as it starts, or never
-//! starts, is tried once more and then left out of every list. One the game
-//! won't start at all (it refuses while a map loads) proves nothing: it is
-//! tried again later, and its verdict is left alone if it never starts.
+//! starts, is tried once more, a while later and after the rest, and then
+//! left out of every list. One the game won't start at all (it refuses while
+//! a map loads) proves nothing: it is tried again later, and its verdict is
+//! left alone if it never starts. The player only runs the check while
+//! exploring, where the game isn't stopping its music for a scene or a load.
 //!
 //! Songs are kept by track key, never by their place in the song list: a
 //! rescan of the music folder moves every game song along, and a verdict
@@ -79,6 +81,11 @@ impl SongCheck {
         (self.done, self.total)
     }
 
+    /// The play id of the song being checked right now, if one is.
+    pub fn probe_id(&self) -> Option<i32> {
+        self.probe.as_ref().map(|p| p.id)
+    }
+
     /// Advances the check. `may_start` is false while the jukebox is playing
     /// a game song, so no new song is started next to it. Returns true once
     /// every song has been checked.
@@ -88,6 +95,9 @@ impl SongCheck {
             if exists {
                 p.seen = true;
                 p.reached = p.reached.max(game.time(p.id));
+                // Kept silent: the game treats the probe as its current BGM
+                // for the moment, and nothing may turn it up.
+                game.set_volume(p.id, 0.0);
             }
             let verdict = if p.reached >= PLAYED {
                 Verdict::Playing
@@ -107,9 +117,15 @@ impl SongCheck {
                     state::lock().set_unplayable_key(&key, false);
                     self.done += 1;
                 }
+                // Cut off once: tried again after the others, and not right
+                // away, so a load or a scene change that stopped it has
+                // passed by then.
                 Verdict::Silent if attempt == 0 => {
                     game.stop(p.id);
-                    self.queue.push_front((key, 1));
+                    self.queue.push_back((key, 1));
+                    self.probe = None;
+                    self.next_at = Instant::now() + REFUSED_WAIT;
+                    return false;
                 }
                 Verdict::Silent => {
                     game.stop(p.id);
@@ -145,7 +161,7 @@ impl SongCheck {
             }
         };
         match game.play_cue(&cue, 0.0) {
-            Some(id) => {
+            Some((id, _)) => {
                 game.set_volume(id, 0.0);
                 self.probe = Some(Probe { key, id, started: Instant::now(), seen: false, reached: 0.0, attempt });
             }
