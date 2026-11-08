@@ -43,16 +43,20 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
 
 ## Screenshots
 
-![The jukebox menu and its settings over the Grandport inn](docs/screenshots/01-hero.jpg)
+![The jukebox menu and its settings over the world map](docs/screenshots/01-hero.jpg)
 
 | | |
 |---|---|
 | ![The menu with the General settings](docs/screenshots/02-settings-general.jpg) | ![The menu with the Battles settings](docs/screenshots/03-settings-battles.jpg) |
-| **General:** crossfade, resume and the mini player | **Battles:** boss music, the victory fanfare and the battle popup |
+| **General:** crossfade, resume, new song on a new map and the mini player | **Battles:** boss music, the victory fanfare, looping and picking up afterwards |
 | ![The menu with the Controls settings](docs/screenshots/04-settings-controls.jpg) | ![The jukebox menu](docs/screenshots/05-menu.jpg) |
 | **Controls:** rebindable keys and controller combos | **The menu:** every game song, your own music and playlists |
+| ![A song's + menu with Play next, Move up and Move down](docs/screenshots/07-song-menu.jpg) | ![A playlist's page](docs/screenshots/09-playlist-page.jpg) |
+| **A song's + menu:** Play next, Move up and Move down, playlists, rename, hide | **A playlist:** Play, Shuffle, and drag or move songs into order |
 
-![The mini player over the inn](docs/screenshots/06-mini-player.jpg)
+![A song that wouldn't play, greyed out with why](docs/screenshots/08-skipped-song.jpg)
+
+![The mini player over the world map](docs/screenshots/06-mini-player.jpg)
 
 ## Requirements
 
