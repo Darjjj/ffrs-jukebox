@@ -5,7 +5,7 @@ music. An in-game menu in the game's own style, a mini player, hotkeys and contr
 
 https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
 
-**[Watch it in full quality on YouTube](https://youtu.be/XU42YjN3Cfk)**
+**[Watch the 1.8 showcase in full quality on YouTube](https://youtu.be/pXe2QZpTQeM)**
 
 ## Features
 
