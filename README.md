@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/fd076333-e541-4f3c-b841-5f5bd7930dd5
 - **Battle popup.** The now-playing popup shows the current song when a battle starts and ends (a setting,
   on by default).
 - **Music by place.** The field, towns and dungeons can each have a list of their own (with its own
-  Shuffle), keep the game's own music, or follow Play from. Vision shrines can keep the game's music too.
+  Shuffle), keep the game's own music, or follow Everywhere. Vision shrines can keep the game's music too.
 - **New song on a new map.** Entering a town or another area can move on to the next song (a setting,
   off by default).
 - **Keeps playing while you talk.** Townsfolk, shops, the inn, bulletin boards and save points don't interrupt your
@@ -80,8 +80,8 @@ That puts `winmm.dll` (the ASI loader) in `FFRS\Binaries\Win64\` and the jukebox
 `FFRS\Binaries\Win64\scripts\`. The `jukebox` folder for your own music and `ffrs_jukebox.toml` appear next to
 the jukebox on the first run.
 
-**Uninstall:** delete `ffrs_jukebox.asi`, `ffrs_jukebox.toml`, `ffrs_jukebox.log` and the `jukebox` folder (your
-own music) from `scripts\`. If no other mod uses the ASI loader, also delete `winmm.dll` and
+**Uninstall:** delete every file whose name starts with `ffrs_jukebox` (the `.asi`, its settings and logs)
+and the `jukebox` folder (your own music) from `scripts\`. If no other mod uses the ASI loader, also delete `winmm.dll` and
 `Ultimate-ASI-Loader_LICENSE.txt` from `Win64\`; the ultrawide fix needs them.
 
 ## Using it
@@ -97,16 +97,17 @@ own music) from `scripts\`. If no other mod uses the ASI loader, also delete `wi
 | **In the menu, by controller** | D-pad or left stick to move, A to choose, B to back out |
 
 Every key can be changed in the menu's ⚙ settings (Controls tab). The General tab holds the crossfade
-length, how long looping game themes play, resuming at start, a new song on a new map, Vision shrines,
-the mini player and the key reminder; the Battles tab holds boss music, the victory fanfare, looping the
+length, resuming at start, a new song on a new map, Vision shrines, the mini player and the key
+reminder (how long looping game themes play is set on the Themes tab); the Battles tab holds boss music, the victory fanfare, looping the
 battle song, picking up after battles and the battle popup. Hotkeys do nothing while you are typing in a
 text box, and only work while the game is the active window.
 
 - **Your own songs:** open the My Music tab and press **Open music folder**, add files, then **Rescan folder**.
 - **Right-click any song** to add it to a playlist, rename it or hide it. Hidden songs can be brought back
   from the Hidden tab.
-- **Play from** picks the list Next and Shuffle draw from; **Music for** picks a separate one for battles,
-  the field, towns or dungeons. **Game themes** is the game's full-length songs without its short jingles.
+- **Music for** picks what plays where. **Everywhere** is the list Next and Shuffle draw from; Battles,
+  Field, Towns and Dungeons can each follow it, have a list of their own, or keep the game's own music.
+  **Game themes** is the game's full-length songs without its short jingles.
 - **Heard in game:** the full menu shows the game's own song you heard last, with a star to add it to
   Favorites.
 - **Greyed-out songs** wouldn't play earlier this session (hover one to see why). Next and Shuffle pass
@@ -130,10 +131,13 @@ text box, and only work while the game is the active window.
 ## Troubleshooting
 
 `ffrs_jukebox.log` next to the `.asi` records what the jukebox does: the songs it found, what played, and
-any errors. Settings live in `ffrs_jukebox.toml`; edit it with the game closed, since the jukebox writes
-it while the game runs. A wrong value in it goes back to its default and the rest is kept (the log says
-which); if the file isn't readable as settings at all, it's kept as `ffrs_jukebox.toml.bad` before
-defaults are written.
+any errors. The log of the session before is kept as `ffrs_jukebox.log.old`, so a crash can still be looked
+into after the game has been started again. Settings live in `ffrs_jukebox.toml`; edit it with the game
+closed, since the jukebox writes it while the game runs. A wrong value in it goes back to its default and
+the rest is kept (the log says which), and the file as it was is kept as `ffrs_jukebox.toml.bad`. If the
+file isn't readable as settings at all (or comes back empty after a power cut), it's kept as `.bad` too and
+your settings are restored from `ffrs_jukebox.toml.bak`, the copy made the last time the file loaded
+cleanly.
 
 ## Building from source
 

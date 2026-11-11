@@ -69,7 +69,8 @@ pub struct Menu {
     keys: KeyPoll,
     pad: keys::PadPoll,
     settings_open: bool,
-    /// The place chosen under "Music for": battles, field, towns, dungeons.
+    /// The place chosen under "Music for": everywhere, battles, field, towns,
+    /// dungeons.
     place_tab: usize,
     /// The keybind waiting for its new key in the settings.
     capturing: Option<Bind>,
@@ -194,7 +195,7 @@ impl Menu {
             toast_serial: 0,
             toast_since: None,
             was_battle: false,
-            place_tab: 1,
+            place_tab: 0,
             battle_changed: None,
             battle_toast_due: false,
             heading: None,
@@ -982,6 +983,17 @@ fn menu_row(s: &state::Shared, rows: &[usize], song_menu: &std::cell::RefCell<Op
     rows.iter().position(|&i| i == at)
 }
 
+/// The song check's progress line. While the jukebox plays a game song the
+/// check can't start songs of its own, so the line says what it waits for
+/// instead of sitting on a count that doesn't move.
+fn check_line(done: usize, total: usize, waiting: bool) -> String {
+    if waiting {
+        format!("Song check paused at {done} / {total}: it carries on while no game song is playing.")
+    } else {
+        format!("Checking songs for missing audio: {done} / {total}")
+    }
+}
+
 /// Which songs a tab shows.
 type Shows = fn(&state::Track) -> bool;
 
@@ -1640,65 +1652,90 @@ impl Menu {
                     s.config.play_in = Some(play);
                     config_changed = true;
                 }
-                let choices = s.play_from_choices();
-                let mut chosen = choices.iter().position(|p| *p == s.config.playlist).unwrap_or(0);
-                let labels: Vec<_> = choices.iter().map(|p| p.label()).collect();
-                field("Play from");
-                if theme::combo(ui, "##from", &mut chosen, &labels) {
-                    s.config.playlist = choices[chosen].clone();
-                    s.push(Command::ListChanged);
-                    config_changed = true;
-                }
-                if ui.is_item_hovered() {
-                    ui.tooltip_text("Which songs Next and Shuffle choose from.\nFolders inside your music folder are listed too.");
-                }
                 // Music by place: one row of place tabs, then the list and
-                // Shuffle for the chosen one. Every place offers "Same as Play
-                // from" and the lists; the areas also the game's own music.
+                // Shuffle for the chosen one. "Everywhere" is the list for
+                // any place without one of its own; a place can follow it,
+                // have its own list, or keep the game's own music.
+                let choices = s.play_from_choices();
                 let shuffle_w = ui.calc_text_size("Shuffle")[0] + ui.frame_height();
                 field("Music for");
-                let places = ["Battles", "Field", "Towns", "Dungeons"];
-                let tab_w = (ui.content_region_avail()[0] - gap[0] * 3.0) / 4.0;
-                for (n, label) in places.iter().enumerate() {
-                    if n > 0 {
-                        ui.same_line();
+                const PLACES: [&str; 5] = ["Everywhere", "Battles", "Field", "Towns", "Dungeons"];
+                {
+                    // Each tab as wide as its word plus an equal share of
+                    // the room left over, so five fit where equal widths
+                    // wouldn't; in a narrow menu they drop to the small font.
+                    let avail = ui.content_region_avail()[0];
+                    let height = ui.frame_height();
+                    let gaps = gap[0] * (PLACES.len() - 1) as f32;
+                    let measure = || PLACES.map(|label| ui.calc_text_size(label)[0]);
+                    let roomy = |words: &[f32; 5]| avail - gaps - words.iter().sum::<f32>() >= 8.0 * PLACES.len() as f32;
+                    let mut words = measure();
+                    let small = (!roomy(&words)).then(|| small_font.map(|f| ui.push_font(f))).flatten();
+                    if small.is_some() {
+                        words = measure();
                     }
-                    let mut on = self.place_tab == n;
-                    if theme::toggle(ui, &format!("{label}##place"), &mut on, [tab_w, ui.frame_height()]) {
-                        self.place_tab = n;
-                    }
-                    if ui.is_item_hovered() {
-                        ui.tooltip_text(match n {
-                            0 => "Music for battles. A battle starts a song from it, and your\n\
-                                  exploring song picks up where it left off afterwards.\n\
-                                  Game's own music is the same as Battles off under Play during.",
-                            1 => "Music while exploring the open field.",
-                            2 => "Music while exploring towns.",
-                            _ => "Music while exploring dungeons, caves and shrines.",
-                        });
+                    let share = ((avail - gaps - words.iter().sum::<f32>()) / PLACES.len() as f32).max(0.0);
+                    for (n, label) in PLACES.iter().enumerate() {
+                        if n > 0 {
+                            ui.same_line();
+                        }
+                        let mut on = self.place_tab == n;
+                        if theme::toggle(ui, &format!("{label}##place"), &mut on, [words[n] + share, height]) {
+                            self.place_tab = n;
+                        }
+                        if ui.is_item_hovered() {
+                            ui.tooltip_text(match n {
+                                0 => "The music for every place that has no list of its own:\n\
+                                      which songs Next and Shuffle choose from.\n\
+                                      Play on a playlist sets this too.",
+                                1 => "Music for battles. A battle starts a song from it, and your\n\
+                                      exploring song picks up where it left off afterwards.\n\
+                                      Game's own music is the same as Battles off under Play during.",
+                                2 => "Music while exploring the open field.",
+                                3 => "Music while exploring towns.",
+                                _ => "Music while exploring dungeons, caves and shrines.",
+                            });
+                        }
                     }
                 }
-                let area = [None, Some(Area::Field), Some(Area::Town), Some(Area::Dungeon)][self.place_tab.min(3)];
-                // For battles, the game's own music is the Battles switch
-                // under Play during: picking one sets the other.
-                let mut labels = vec!["Same as Play from".to_string(), "Game's own music".to_string()];
+                // Which place the chosen tab is: everywhere, battles, or
+                // one kind of area.
+                let everywhere = self.place_tab == 0;
+                let area = [None, None, Some(Area::Field), Some(Area::Town), Some(Area::Dungeon)][self.place_tab.min(4)];
+                // "Everywhere" offers the lists alone. A place offers two
+                // more ahead of them: to go along with the music there
+                // already is, or to keep the game's own. For battles, the
+                // game's own music is the Battles switch under Play during:
+                // picking one sets the other.
+                let mut labels = match (everywhere, area) {
+                    (true, _) => Vec::new(),
+                    (false, None) => vec!["Keep the exploring music".to_string(), "Game's own music".to_string()],
+                    (false, Some(_)) => vec!["Same as Everywhere".to_string(), "Game's own music".to_string()],
+                };
                 let lists_from = labels.len();
                 labels.extend(choices.iter().map(|p| p.label()));
-                let mut chosen = match area {
-                    None if !s.config.play_in().battles => 1,
-                    None => s.config.battle_playlist.as_ref().and_then(|b| choices.iter().position(|p| p == b)).map_or(0, |i| i + lists_from),
-                    Some(a) => match s.config.area_music(a) {
+                let listed = |p: &Playlist| choices.iter().position(|c| c == p).map(|i| i + lists_from);
+                let mut chosen = match (everywhere, area) {
+                    (true, _) => listed(&s.config.playlist).unwrap_or(0),
+                    (false, None) if !s.config.play_in().battles => 1,
+                    (false, None) => s.config.battle_playlist.as_ref().and_then(listed).unwrap_or(0),
+                    (false, Some(a)) => match s.config.area_music(a) {
                         AreaMusic::PlayFrom => 0,
                         AreaMusic::Game => 1,
-                        AreaMusic::List(p) => choices.iter().position(|c| c == p).map_or(0, |i| i + lists_from),
+                        AreaMusic::List(p) => listed(p).unwrap_or(0),
                     },
                 };
                 field("");
                 let combo_w = ui.content_region_avail()[0] - shuffle_w - gap[0];
                 if theme::combo_width(ui, "##placemusic", &mut chosen, &labels, combo_w) {
                     let list = (chosen >= lists_from).then(|| choices[chosen - lists_from].clone());
-                    match area {
-                        None => {
+                    match (everywhere, area) {
+                        (true, _) => {
+                            if let Some(list) = list {
+                                s.config.playlist = list;
+                            }
+                        }
+                        (false, None) => {
                             let mut play = s.config.play_in();
                             play.battles = chosen != 1;
                             s.config.play_in = Some(play);
@@ -1706,7 +1743,7 @@ impl Menu {
                                 s.config.battle_playlist = list;
                             }
                         }
-                        Some(a) => {
+                        (false, Some(a)) => {
                             *s.config.area_music_mut(a) = match (chosen, list) {
                                 (_, Some(p)) => AreaMusic::List(p),
                                 (1, None) => AreaMusic::Game,
@@ -1718,22 +1755,24 @@ impl Menu {
                     config_changed = true;
                 }
                 ui.same_line();
-                // A place with a list of its own shuffles on its own.
+                // "Everywhere" has the main Shuffle (the same switch as the
+                // one beside Repeat); a place with a list of its own
+                // shuffles on its own.
                 let own_list = chosen >= lists_from;
                 {
                     let _off = ui.begin_disabled(!own_list);
-                    let shuffle = match area {
-                        None => &mut s.config.battle_shuffle,
-                        Some(a) => s.config.area_shuffle_mut(a),
+                    let shuffle = match (everywhere, area) {
+                        (true, _) => &mut s.config.shuffle,
+                        (false, None) => &mut s.config.battle_shuffle,
+                        (false, Some(a)) => s.config.area_shuffle_mut(a),
                     };
                     config_changed |= theme::toggle(ui, "Shuffle##place", shuffle, [shuffle_w, ui.frame_height()]);
                 }
                 if ui.is_item_hovered_with_flags(ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
-                    ui.tooltip_text(if own_list {
-                        "Shuffle this list. Separate from the main Shuffle."
-                    } else {
-                        "Pick a list here to shuffle it on its own.
-Until then, it follows the main Shuffle."
+                    ui.tooltip_text(match (everywhere, own_list) {
+                        (true, _) => "Shuffle the Everywhere list. The same switch as Shuffle beside Repeat.",
+                        (false, true) => "Shuffle this list. Separate from Everywhere's Shuffle.",
+                        (false, false) => "Pick a list here to shuffle it on its own.",
                     });
                 }
                 let mut vol = s.config.volume * 100.0;
@@ -2012,7 +2051,7 @@ Click to try it again."));
                             ui.text_disabled("The game's songs appear once a save is loaded.");
                         }
                         if let (true, Some((done, total))) = (game, s.check_progress) {
-                            ui.text_disabled(format!("Checking songs for missing audio: {done} / {total}"));
+                            note(ui, &check_line(done, total, s.check_waiting));
                         }
                         if label == "Themes" {
                             let mut mins = s.config.loop_minutes;
@@ -2030,10 +2069,16 @@ Click to try it again."));
                         }
                         if !game {
                             if ui.small_button("Open music folder") {
-                                let _ = std::fs::create_dir_all(&s.music_dir);
-                                if let Err(e) = std::process::Command::new("explorer.exe").arg(&s.music_dir).spawn() {
-                                    log::error!("menu: could not open {}: {e}", s.music_dir.display());
-                                }
+                                // Off this thread: starting a program takes
+                                // a moment, and the menu holds the state the
+                                // player waits on.
+                                let dir = s.music_dir.clone();
+                                std::thread::spawn(move || {
+                                    let _ = std::fs::create_dir_all(&dir);
+                                    if let Err(e) = std::process::Command::new("explorer.exe").arg(&dir).spawn() {
+                                        log::error!("menu: could not open {}: {e}", dir.display());
+                                    }
+                                });
                             }
                             if ui.is_item_hovered() {
                                 ui.tooltip_text(format!(
@@ -2100,9 +2145,7 @@ Click to try it again."));
                         // Rarely needed, so it lives here rather than over the
                         // song lists.
                         match s.check_progress {
-                            Some((done, total)) => {
-                                ui.text_disabled(format!("Checking songs for missing audio: {done} / {total}"))
-                            }
+                            Some((done, total)) => note(ui, &check_line(done, total, s.check_waiting)),
                             None if s.game_tracks_ready => {
                                 if ui.small_button("Check songs again") {
                                     s.push(Command::CheckSongs);
@@ -2110,8 +2153,9 @@ Click to try it again."));
                                 if ui.is_item_hovered() {
                                     ui.tooltip_text(
                                         "Silently plays every game song for a moment and\n\
-                                         removes any with no audio. Runs by itself once\n\
-                                         per game version.",
+                                         removes any with no audio. Takes about four minutes,\n\
+                                         and only runs while you explore with no game song\n\
+                                         playing from the jukebox (stopped, or one of your own).",
                                     );
                                 }
                             }

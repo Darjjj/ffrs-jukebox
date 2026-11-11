@@ -311,8 +311,8 @@ pub struct Config {
     /// from the game's files), learned as they fail and left out of every
     /// list. Cleared when the game updates, so each gets another try.
     pub unplayable: Vec<String>,
-    /// The game build `unplayable` was learned on: the exe's size and
-    /// modified time.
+    /// The game build `unplayable` was learned on: the link time stamped in
+    /// the exe's header.
     pub game_build: String,
     /// The game build every song was last checked for audio on.
     pub checked_build: String,
@@ -559,6 +559,15 @@ pub fn persisting() -> bool {
     PERSIST.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// The settings file was damaged or empty at start, and the settings came
+/// from the spare copy instead.
+static RESTORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this session's settings were restored from the spare copy.
+pub fn restored() -> bool {
+    RESTORED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Work for the writer thread.
 enum Write {
     Save(PathBuf, Config),
@@ -707,24 +716,74 @@ impl Config {
             }
         };
         // Notepad's "Unicode" saves UTF-16, which isn't TOML.
-        let Ok(text) = String::from_utf8(bytes) else {
-            return Self::damaged(path, "isn't saved as UTF-8");
+        let parsed = match String::from_utf8(bytes) {
+            Ok(text) => Self::parse(&text),
+            Err(_) => Err("isn't saved as UTF-8".to_string()),
         };
-        let table: toml::Table = match text.parse() {
-            Ok(table) => table,
-            Err(e) => return Self::damaged(path, &format!("is invalid: {e}")),
+        let mut config = match parsed {
+            Ok((config, false)) => {
+                // A file that reads cleanly is kept as the copy to fall back
+                // on, should the real one ever come back damaged or empty.
+                if let Err(e) = std::fs::copy(path, Self::spare(path)) {
+                    log::warn!("config: could not keep a spare copy of the settings: {e}");
+                }
+                config
+            }
+            Ok((config, true)) => {
+                // Something in it didn't read and went back to its default
+                // (the log says what). The next save drops it for good, so
+                // the file as it was is kept, like a damaged one.
+                if let Some(kept) = Self::keep_aside(path) {
+                    log::error!("config: the settings file as it was is kept as {}", kept.display());
+                }
+                config
+            }
+            Err(why) => Self::damaged(path, &why),
         };
+        config.sanitize();
+        config
+    }
+
+    /// Reads settings from `text`, and says whether anything in it had to
+    /// be dropped to do so. An error when it isn't settings at all: not
+    /// TOML, or nothing but blank space, which is what a file cut short by
+    /// a crash or a power cut looks like (and never what the jukebox writes).
+    fn parse(text: &str) -> Result<(Self, bool), String> {
+        if text.trim_matches(|c: char| c.is_whitespace() || c == '\0').is_empty() {
+            return Err("is empty".into());
+        }
+        let table: toml::Table = text.parse().map_err(|e| format!("is invalid: {e}"))?;
         // Keys the jukebox doesn't know (a typo in a hand edit) are dropped
         // by the next save, so they're at least named here.
         let unknown = |path: serde_ignored::Path| {
             log::warn!("config: `{path}` isn't a setting the jukebox knows, and won't be kept");
         };
-        let mut config = match serde_ignored::deserialize(toml::Value::Table(table.clone()), unknown) {
-            Ok(config) => config,
-            Err(_) => Self::salvage(table),
-        };
-        config.sanitize();
-        config
+        Ok(match serde_ignored::deserialize(toml::Value::Table(table.clone()), unknown) {
+            Ok(config) => (config, false),
+            Err(_) => (Self::salvage(table), true),
+        })
+    }
+
+    /// Where the spare copy of the settings is kept: the file as it last
+    /// loaded cleanly.
+    fn spare(path: &Path) -> PathBuf {
+        path.with_extension("toml.bak")
+    }
+
+    /// Copies the settings file aside as `.bad` (`.bad1`, `.bad2`... so an
+    /// earlier one is never overwritten). The copy's path, if it was made.
+    fn keep_aside(path: &Path) -> Option<PathBuf> {
+        let backup = (0..10)
+            .map(|n| path.with_extension(if n == 0 { "toml.bad".to_string() } else { format!("toml.bad{n}") }))
+            .find(|p| !p.exists())
+            .unwrap_or_else(|| path.with_extension("toml.bad9"));
+        match std::fs::copy(path, &backup) {
+            Ok(_) => Some(backup),
+            Err(e) => {
+                log::error!("config: {} could not be backed up: {e}", path.display());
+                None
+            }
+        }
     }
 
     /// A file with a wrong value somewhere (`repeat = "all"`, a key code
@@ -745,23 +804,30 @@ impl Config {
         kept.try_into().unwrap_or_default()
     }
 
-    /// A file that isn't TOML at all: kept aside before anything is saved
-    /// over it, so favorites, playlists and keys in it can be recovered. An
-    /// earlier `.bad` is never overwritten.
+    /// A file that isn't settings at all: kept aside before anything is
+    /// saved over it, so favorites, playlists and keys in it can be
+    /// recovered. The settings then come from the spare copy made the last
+    /// time the file loaded cleanly, if there is one, else the defaults.
     fn damaged(path: &Path, why: &str) -> Self {
-        let backup = (0..10)
-            .map(|n| path.with_extension(if n == 0 { "toml.bad".to_string() } else { format!("toml.bad{n}") }))
-            .find(|p| !p.exists())
-            .unwrap_or_else(|| path.with_extension("toml.bad9"));
-        match std::fs::copy(path, &backup) {
-            Ok(_) => log::error!(
-                "config: {} {why}; using defaults, the old file is kept as {}",
-                path.display(),
-                backup.display()
-            ),
-            Err(ce) => log::error!("config: {} {why}, and could not be backed up: {ce}", path.display()),
+        match Self::keep_aside(path) {
+            Some(kept) => log::error!("config: {} {why}; the file is kept as {}", path.display(), kept.display()),
+            None => log::error!("config: {} {why}", path.display()),
         }
-        Self::default()
+        let spare = Self::spare(path);
+        match std::fs::read_to_string(&spare).map_err(|e| e.to_string()).and_then(|text| Self::parse(&text)) {
+            Ok((config, _)) => {
+                log::warn!("config: settings restored from the spare copy, {}", spare.display());
+                RESTORED.store(true, std::sync::atomic::Ordering::SeqCst);
+                config
+            }
+            Err(e) => {
+                if spare.exists() {
+                    log::error!("config: the spare copy {} is no use either ({e})", spare.display());
+                }
+                log::error!("config: using the default settings");
+                Self::default()
+            }
+        }
     }
 
     /// Puts a loaded file right: hand-edited numbers back in range (a NaN or
@@ -836,7 +902,15 @@ impl Config {
         static SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("toml.tmp{n}"));
-        if let Err(e) = std::fs::write(&tmp, text) {
+        // Flushed to the disk before the swap: without it the swap can
+        // outlive a power cut or a system crash that the file's contents
+        // don't, leaving an empty settings file in place of a good one.
+        let written = std::fs::File::create(&tmp).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        });
+        if let Err(e) = written {
             log::error!("config: could not write {}: {e}", tmp.display());
             let _ = std::fs::remove_file(&tmp);
             return;
@@ -1006,6 +1080,67 @@ mod tests {
         assert_eq!(config.volume, Config::default().volume);
         assert_eq!(std::fs::read(path.with_extension("toml.bad")).unwrap(), bytes);
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "the file itself isn't saved over at load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_or_blanked_file_comes_back_from_the_spare_copy() {
+        let dir = std::env::temp_dir().join(format!("ffrs_jukebox_spare_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ffrs_jukebox.toml");
+        let good = "volume = 0.5\nfavorites = [\"game:BGM_PP_PRELUDE\"]\n";
+        std::fs::write(&path, good).unwrap();
+        // A clean load keeps a spare copy.
+        assert_eq!(Config::load(&path).favorites, vec!["game:BGM_PP_PRELUDE".to_string()]);
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.bak")).unwrap(), good);
+        // A power cut leaves the file empty, or full of NULs: the settings
+        // come back from the spare, not as defaults.
+        for (n, wrecked) in ["", "\0\0\0\0\0\0\0\0", "favorites = [\"game:X\"\nnot toml"].into_iter().enumerate() {
+            std::fs::write(&path, wrecked).unwrap();
+            let c = Config::load(&path);
+            assert_eq!(c.favorites, vec!["game:BGM_PP_PRELUDE".to_string()], "case {n}");
+            assert_eq!(c.volume, 0.5);
+            // The wrecked file never replaces the spare.
+            assert_eq!(std::fs::read_to_string(path.with_extension("toml.bak")).unwrap(), good);
+        }
+        assert!(path.with_extension("toml.bad").exists() && path.with_extension("toml.bad2").exists());
+        // With no spare to fall back on, an empty file means defaults.
+        std::fs::remove_file(path.with_extension("toml.bak")).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert!(Config::load(&path).favorites.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wrong_value_keeps_the_rest_and_the_file_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("ffrs_jukebox_salvage_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ffrs_jukebox.toml");
+        let slip = "volume = 0.5\nfavorites = [\"game:BGM_PP_PRELUDE\"]\nplaylists = \"oops\"\n";
+        std::fs::write(&path, slip).unwrap();
+        let c = Config::load(&path);
+        assert_eq!(c.volume, 0.5);
+        assert_eq!(c.favorites.len(), 1);
+        assert!(c.playlists.is_empty());
+        // The next save drops what didn't read, so the file is kept aside,
+        // and it doesn't become the spare copy.
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.bad")).unwrap(), slip);
+        assert!(!path.with_extension("toml.bak").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_leaves_no_temporary_file_behind() {
+        let dir = std::env::temp_dir().join(format!("ffrs_jukebox_save_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ffrs_jukebox.toml");
+        let mut c = Config::default();
+        c.favorites = vec!["game:BGM_PP_PRELUDE".into()];
+        c.save(&path);
+        c.save(&path);
+        assert_eq!(toml::from_str::<Config>(&std::fs::read_to_string(&path).unwrap()).unwrap().favorites, c.favorites);
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("ffrs_jukebox.toml")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

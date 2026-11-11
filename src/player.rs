@@ -35,6 +35,19 @@ static REOPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// An output is being opened on a thread of its own.
 static OPENING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Windows' default sound device is no longer the one the output was opened
+/// on (speakers switched to a headset, say): the output stays on the old
+/// device by itself, so the player opens it again on the new one.
+static DEVICE_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How often the output's thread asks which device is the default.
+const DEVICE_CHECK: Duration = Duration::from_secs(2);
+
+/// The name of Windows' default sound device right now, if it has one.
+fn default_device_name() -> Option<String> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    rodio::cpal::default_host().default_output_device()?.name().ok()
+}
+
 /// The open audio output, if there is one right now. Never opens one: that
 /// takes a moment on the device, and the game thread doesn't wait for it
 /// (see [`open_output`]).
@@ -69,6 +82,7 @@ fn open_output() {
     }
     std::thread::spawn(|| {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let mut device = default_device_name();
         let opened = OutputStream::try_default();
         let mut out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
         match opened {
@@ -88,7 +102,19 @@ fn open_output() {
                     drop(out);
                     // Kept until the game closes or the output is reset:
                     // dropping the stream silences every file at once.
-                    let _ = stop_rx.recv();
+                    // Meanwhile the default device is watched: the stream
+                    // stays on the device it was opened on, so a change is
+                    // handed to the player, which resets the output.
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stop_rx.recv_timeout(DEVICE_CHECK) {
+                        let now = default_device_name();
+                        if now.is_some() && now != device {
+                            if device.is_some() {
+                                log::info!("player: the default sound device is now {}", now.as_deref().unwrap_or_default());
+                                DEVICE_CHANGED.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            device = now;
+                        }
+                    }
                     drop(stream);
                 }
             }
@@ -193,6 +219,10 @@ enum Playing {
         seen: bool,
         /// Furthest play position seen, to tell a cut-off start from an end.
         reached: f32,
+        /// Where it was started: a song picked up after a battle, at the
+        /// game's start or by a seek begins well past zero, and "cut off as
+        /// it started" is measured from there.
+        from: f32,
         attempt: u8,
         /// A looping theme, faded out over its last [`THEME_FADE`] seconds.
         fades: bool,
@@ -239,8 +269,9 @@ pub struct Player {
     /// Previous stays within the battle music or the exploring music.
     other_history: Vec<usize>,
     volume: f32,
-    /// A cut-off cue waiting to be started again: track, attempt, when.
-    retry: Option<(usize, u8, Instant)>,
+    /// A cut-off cue waiting to be started again: track, attempt, when, and
+    /// the place in the song it was started at.
+    retry: Option<(usize, u8, Instant, f32)>,
     /// The current song was picked by Next, Shuffle or a playlist rather
     /// than clicked, so if it will not play the next one is tried.
     auto: bool,
@@ -451,7 +482,7 @@ impl Player {
             Some((i, Playing::File { sink, offset, .. })) => Some((*i, Playing::file_pos(sink, *offset))),
             // Between attempts at a cut-off song, or waiting for the output,
             // that song is still the current one.
-            None => self.retry.map(|(i, ..)| (i, 0.0)).or(self.waiting),
+            None => self.retry.map(|(i, _, _, at)| (i, at)).or(self.waiting),
         }
     }
 
@@ -721,10 +752,9 @@ impl Player {
         // is playing, nor outside plain exploring: a battle, a scene or a
         // movie starting stops the game's sounds, which would read as a
         // song with no audio.
-        let busy = matches!(self.now, Some((_, Playing::Cue { .. })))
-            || self.retry.is_some()
-            || scene != crate::config::Scene::Exploring;
-        let finished = check.step(game, !busy);
+        let exploring = scene == crate::config::Scene::Exploring;
+        let playing_cue = matches!(self.now, Some((_, Playing::Cue { .. }))) || self.retry.is_some();
+        let finished = check.step(game, exploring && !playing_cue, exploring);
         let progress = check.progress();
         let mut s = state::lock();
         if finished {
@@ -732,8 +762,11 @@ impl Player {
             s.config.checked_build = s.config.game_build.clone();
             s.save_config();
             s.check_progress = None;
+            s.check_waiting = false;
         } else {
             s.check_progress = Some(progress);
+            // The menu says why the count has stopped moving.
+            s.check_waiting = playing_cue;
         }
     }
 
@@ -766,12 +799,12 @@ impl Player {
             }
             self.run(c, game);
         }
-        if let Some((i, attempt, at)) = self.retry
-            && Instant::now() >= at
+        if let Some((i, attempt, when, from)) = self.retry
+            && Instant::now() >= when
         {
             self.retry = None;
             log::info!("player: retrying (attempt {})", attempt + 1);
-            self.keeping_intent(game, |p, game| p.start_attempt(i, 0.0, attempt, game));
+            self.keeping_intent(game, |p, game| p.start_attempt(i, from, attempt, game));
         }
         if let Some(i) = self.skip_from.take() {
             // A pause made while the failed song was starting holds.
@@ -789,6 +822,7 @@ impl Player {
         self.fade_files();
         self.finish_opening();
         self.after_reopen(game);
+        self.after_device_change(game);
         self.start_waiting(game);
         self.watch_stall(game);
 
@@ -814,7 +848,7 @@ impl Player {
         // nothing to crossfade into, and the crossfade point would cut it.
         let cf = if last { 0.0 } else { cf };
         let finished = match &mut self.now {
-            Some((i, Playing::Cue { id, duration, offset, paused: false, started, seen, reached, attempt, fades, fading })) => {
+            Some((i, Playing::Cue { id, duration, offset, paused: false, started, seen, reached, from, attempt, fades, fading })) => {
                 // A looping theme held for the whole fight just keeps looping
                 // in the game, with no fade or cut at the end of its length.
                 let duration = if loop_battle && *fades { None } else { *duration };
@@ -832,10 +866,10 @@ impl Player {
                         failed = Some(*i);
                     }
                     false
-                } else if !exists && *reached < 1.0 {
+                } else if !exists && cut_off_at_start(*reached, *from, duration) {
                     log::debug!("player: cue id {id} was cut off as it started (attempt {})", *attempt + 1);
                     if *attempt + 1 < CUE_RETRIES {
-                        cut_off = Some((*i, *attempt + 1));
+                        cut_off = Some((*i, *attempt + 1, *from));
                     } else {
                         failed = Some(*i);
                     }
@@ -870,18 +904,18 @@ impl Player {
             _ => false,
         };
         // A cue that has really played clears any earlier failure.
-        if let Some((i, Playing::Cue { reached, .. })) = &self.now
-            && *reached >= 1.0
+        if let Some((i, Playing::Cue { reached, from, .. })) = &self.now
+            && *reached - *from >= CUT_OFF_WITHIN
         {
             let mut s = state::lock();
             if s.is_unplayable(*i) {
                 s.set_unplayable(*i, false);
             }
         }
-        if let Some((i, attempt)) = cut_off {
+        if let Some((i, attempt, from)) = cut_off {
             // Keep showing the song as current while it waits.
             self.now = None;
-            self.retry = Some((i, attempt, Instant::now() + CUE_RETRY_DELAY));
+            self.retry = Some((i, attempt, Instant::now() + CUE_RETRY_DELAY, from));
         } else if let Some(i) = failed {
             // A cue the game would not play: skipped for this session, never
             // removed for good. A cue is cut off while a map loads, or held
@@ -901,9 +935,12 @@ impl Player {
         // while it runs: it is never muted and restored, read as the
         // fanfare, or kept as the song heard.
         let probe = self.check.as_ref().and_then(|c| c.probe_id());
+        // The last song checked too: the game can go on naming it as its
+        // current music for a moment after it's stopped.
+        let bgm_is_probe = game.current_bgm().is_some_and(|id| self.check.as_ref().is_some_and(|c| c.is_probe(id)));
         // The game's victory fanfare plays out over a won battle's results;
         // the jukebox picks up again once the game moves on from it.
-        let bgm_cue = if probe.is_some() && game.current_bgm() == probe { None } else { game.current_bgm_cue() };
+        let bgm_cue = if bgm_is_probe { None } else { game.current_bgm_cue() };
         let mut fanfare = fanfare_setting && bgm_cue.as_deref() == Some(crate::game::VICTORY_CUE);
         // The battle ends a moment after the fanfare does; the battle song
         // stays down until then instead of coming back for that moment.
@@ -936,11 +973,11 @@ impl Player {
         }
         // The game's own song, heard while the game has the music, is kept
         // so it can be favorited afterwards. Only one the song list knows,
-        // never while the song check is starting songs of its own, and not
-        // the victory fanfare, which would replace the song you meant after
-        // every won battle.
+        // never a song the song check started itself (`bgm_cue` leaves those
+        // out; a check that is only waiting its turn doesn't stop this), and
+        // not the victory fanfare, which would replace the song you meant
+        // after every won battle.
         if !active
-            && self.check.is_none()
             && scene != crate::config::Scene::Movie
             && let Some(cue) = &bgm_cue
             && cue != crate::game::VICTORY_CUE
@@ -990,7 +1027,7 @@ impl Player {
             .now
             .as_ref()
             .map(|(i, _)| *i)
-            .or(self.retry.map(|(i, _, _)| i))
+            .or(self.retry.map(|(i, ..)| i))
             .or(self.skip_from)
             .or(self.waiting.map(|(i, _)| i));
         match &self.now {
@@ -1168,7 +1205,7 @@ impl Player {
         let (now_at, retry_at, skip_at, waiting_at) = (find(now), find(retry), find(skip), find(waiting));
         let (battle_at, fight_at) = (find(battle), find(fight));
         drop(s);
-        self.retry = self.retry.zip(retry_at).map(|((_, attempt, when), at)| (at, attempt, when));
+        self.retry = self.retry.zip(retry_at).map(|((_, attempt, when, from), at)| (at, attempt, when, from));
         self.skip_from = skip_at;
         self.waiting = self.waiting.zip(waiting_at).map(|((_, pos), at)| (at, pos));
         self.battle_resume = self.battle_resume.zip(battle_at).map(|((_, pos), at)| (at, pos));
@@ -1238,8 +1275,16 @@ impl Player {
                 self.start(i, game);
             }
             None => {
+                // The playlist has played out (Repeat off). Like Stop, that
+                // leaves nothing to pick up at the next start: the place
+                // saved is the end of its last song, which would start,
+                // end at once and move on.
                 self.stop(game);
-                state::lock().playing = false;
+                let mut s = state::lock();
+                s.playing = false;
+                if s.config.last_song.take().is_some() {
+                    s.save_config();
+                }
             }
         }
     }
@@ -1387,6 +1432,7 @@ impl Player {
                         started: Instant::now(),
                         seen: false,
                         reached: 0.0,
+                        from: if at.is_finite() { at.max(0.0) } else { 0.0 },
                         attempt,
                         fades: *looping,
                         fading: false,
@@ -1530,6 +1576,31 @@ impl Player {
         }
     }
 
+    /// Windows' default sound device changed: the output is opened again on
+    /// the new one, and a file that was playing carries on there from where
+    /// it was (paused, if it was paused).
+    fn after_device_change(&mut self, game: &mut Game) {
+        if !DEVICE_CHANGED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if CLOSING.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Some((i, at)) = self.position(game)
+            && matches!(self.now, Some((_, Playing::File { .. })))
+        {
+            log::info!("player: moving your music to the new sound device at {at:.0}s");
+            self.stop(game);
+            self.waiting = Some((i, at));
+        }
+        // Songs still fading out are on the old output, which is going.
+        for (sink, ..) in self.fading_files.drain(..) {
+            sink.stop();
+        }
+        reset_output();
+        open_output();
+    }
+
     /// Starts the song waiting for the audio output once the output is
     /// open; gives up with the no-device message if it couldn't be opened.
     /// While the game's window is away it just waits.
@@ -1641,6 +1712,19 @@ fn after_up_next(s: &state::Shared, (played, before): (String, Option<String>), 
     } else {
         current
     }
+}
+
+/// A game song that goes quiet within this many seconds of where it was
+/// started was cut off by the game, not played.
+const CUT_OFF_WITHIN: f32 = 1.0;
+
+/// Whether a game song that has gone quiet was cut off as it started, rather
+/// than having ended: it got under a second on from `from`, where it was
+/// started (the game's time for a song counts from the song's top, so one
+/// picked up two minutes in reads two minutes at once), and it isn't at its
+/// own end, which a seek into a song's last moments reaches as quickly.
+fn cut_off_at_start(reached: f32, from: f32, duration: Option<f32>) -> bool {
+    reached - from < CUT_OFF_WITHIN && !duration.is_some_and(|d| reached >= d - 1.5)
 }
 
 /// How long before its end a song of `duration` seconds crossfades into
@@ -1965,6 +2049,21 @@ mod tests {
         assert!((crossfade_for(8.0, 2.0) - 2.0 / 3.0).abs() < 1e-6);
         assert_eq!(crossfade_for(8.0, 240.0), 8.0);
         assert_eq!(crossfade_for(0.0, 240.0), 0.0);
+    }
+
+    #[test]
+    fn a_song_cut_off_where_it_was_picked_up_is_not_taken_for_finished() {
+        // From the top, quiet after a moment: cut off.
+        assert!(cut_off_at_start(0.0, 0.0, Some(180.0)));
+        assert!(cut_off_at_start(0.4, 0.0, None));
+        // Picked up at 109 s after a battle and quiet at once: cut off too,
+        // though the game's clock already reads 109 s.
+        assert!(cut_off_at_start(109.2, 109.2, Some(180.0)));
+        // It played on for a while from there: it ended.
+        assert!(!cut_off_at_start(125.0, 109.2, Some(180.0)));
+        assert!(!cut_off_at_start(3.0, 0.0, None));
+        // A seek into a jingle's last moments runs out that quickly by itself.
+        assert!(!cut_off_at_start(24.6, 24.2, Some(24.8)));
     }
 
     #[test]

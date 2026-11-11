@@ -217,12 +217,8 @@ pub fn row_rule(ui: &Ui, min: [f32; 2], max: [f32; 2]) {
 }
 
 /// A dropdown in the game's style: no arrow box, just a thin cyan chevron at
-/// the right of the field. Fills the rest of the row.
-pub fn combo<S: AsRef<str>>(ui: &Ui, id: &str, current: &mut usize, items: &[S]) -> bool {
-    combo_width(ui, id, current, items, ui.content_region_avail()[0])
-}
-
-/// [`combo`], `w` wide, leaving room on the row for something after it.
+/// the right of the field. `w` wide, leaving room on the row for something
+/// after it.
 pub fn combo_width<S: AsRef<str>>(ui: &Ui, id: &str, current: &mut usize, items: &[S], w: f32) -> bool {
     let [x, y] = ui.cursor_screen_pos();
     let h = ui.frame_height();

@@ -45,6 +45,9 @@ pub struct SongCheck {
     silent: Vec<String>,
     /// Songs the game wouldn't start, and how often.
     refused: HashMap<String, u8>,
+    /// The play id of the last song checked, kept after it's stopped: the
+    /// game can go on naming it as its current music for a moment.
+    last_id: Option<i32>,
 }
 
 enum Verdict {
@@ -67,6 +70,7 @@ impl SongCheck {
             next_at: Instant::now(),
             silent: Vec::new(),
             refused: HashMap::new(),
+            last_id: None,
         }
     }
 
@@ -86,10 +90,18 @@ impl SongCheck {
         self.probe.as_ref().map(|p| p.id)
     }
 
+    /// Whether `id` is the song being checked, or the last one that was.
+    pub fn is_probe(&self, id: i32) -> bool {
+        self.last_id == Some(id)
+    }
+
     /// Advances the check. `may_start` is false while the jukebox is playing
-    /// a game song, so no new song is started next to it. Returns true once
-    /// every song has been checked.
-    pub fn step(&mut self, game: &mut Game, may_start: bool) -> bool {
+    /// a game song, so no new song is started next to it. `exploring` is
+    /// whether the game is plainly exploring: a song that goes quiet as a
+    /// battle, a scene or a movie begins was stopped by the game, which says
+    /// nothing about its audio, so it's tried again without that counting.
+    /// Returns true once every song has been checked.
+    pub fn step(&mut self, game: &mut Game, may_start: bool, exploring: bool) -> bool {
         if let Some(p) = &mut self.probe {
             let exists = game.exists(p.id);
             if exists {
@@ -112,6 +124,13 @@ impl SongCheck {
             let (key, attempt) = (p.key.clone(), p.attempt);
             match verdict {
                 Verdict::Waiting => return false,
+                Verdict::Silent if !exploring => {
+                    game.stop(p.id);
+                    self.queue.push_back((key, attempt));
+                    self.probe = None;
+                    self.next_at = Instant::now() + REFUSED_WAIT;
+                    return false;
+                }
                 Verdict::Playing => {
                     game.stop(p.id);
                     state::lock().set_unplayable_key(&key, false);
@@ -163,6 +182,7 @@ impl SongCheck {
         match game.play_cue(&cue, 0.0) {
             Some((id, _)) => {
                 game.set_volume(id, 0.0);
+                self.last_id = Some(id);
                 self.probe = Some(Probe { key, id, started: Instant::now(), seen: false, reached: 0.0, attempt });
             }
             None => {

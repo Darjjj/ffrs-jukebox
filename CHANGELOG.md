@@ -1,5 +1,24 @@
 ﻿# Changelog
 
+## 1.8.1 - 2026-11-10
+
+- Fixed "Checking songs for missing audio" staying in the menu for good, and "Heard in game" not
+  updating, for anyone who plays game songs from the moment the game starts. The check now knows
+  this game version's songs already; "Check songs again" still runs it by hand.
+- Your settings are safer against a power cut or a system crash: saves are written through to the
+  disk, and if the settings file ever comes back empty or damaged, your settings are restored from
+  a copy made at the last good start instead of going back to defaults.
+- Your own music follows you when you switch Windows' sound device (speakers to a headset, say)
+  instead of staying on the old one until the game restarts.
+- A game song picked up after a battle or at the game's start that the game cuts off is started
+  again where it was, instead of being skipped. A playlist that has played to its end (Repeat off)
+  stays quiet at the next start, like Stop.
+- "Play from" is now the **Everywhere** tab under Music for, so all the lists are chosen in one
+  row. Nothing changes in how it plays; your settings carry over as they are.
+- A lighter load on the game while it plays.
+- The log of the session before is kept as `ffrs_jukebox.log.old`. The jukebox also works next to
+  mods that hook the same game function, and says so plainly when one gets in its way.
+
 ## 1.8.0 - 2026-11-07
 
 - New: a song that wouldn't play stays in your lists, greyed out, with why on hover. Click it to try it

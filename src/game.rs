@@ -55,15 +55,38 @@ thread_local! {
 /// can be traced to the jukebox (or ruled out).
 const SLOW_TICK: std::time::Duration = std::time::Duration::from_millis(4);
 
+/// Where one tick's time went, for the slow-tick line.
+#[derive(Clone, Copy, Default)]
+struct Times {
+    /// Walking the object list (see [`watch_step`]).
+    walk: std::time::Duration,
+    /// Asking the game's text boxes whether one has the keyboard, and how
+    /// many there were to ask.
+    text: std::time::Duration,
+    text_boxes: usize,
+    /// Asking the movie players whether one is playing, and how many.
+    movies: std::time::Duration,
+    players: usize,
+    /// The battle and event checks.
+    scene: std::time::Duration,
+}
+
 thread_local! {
-    /// How long this tick's object scan (see [`watch`]) and scene check took.
-    static TIMES: std::cell::Cell<(std::time::Duration, std::time::Duration)> =
-        const { std::cell::Cell::new((std::time::Duration::ZERO, std::time::Duration::ZERO)) };
+    static TIMES: std::cell::Cell<Times> = const {
+        std::cell::Cell::new(Times {
+            walk: std::time::Duration::ZERO,
+            text: std::time::Duration::ZERO,
+            text_boxes: 0,
+            movies: std::time::Duration::ZERO,
+            players: 0,
+            scene: std::time::Duration::ZERO,
+        })
+    };
 }
 
 fn tick() {
     let started = std::time::Instant::now();
-    TIMES.set(Default::default());
+    TIMES.set(Times::default());
     PLAYER.with_borrow_mut(|player| {
         let player = player.get_or_insert_with(Player::new);
         player.tick(&mut Game::get());
@@ -76,13 +99,19 @@ fn tick() {
     }
     if took > SLOW_TICK && LAST_SLOW.get().is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
         LAST_SLOW.set(Some(std::time::Instant::now()));
-        let (scan, scene) = TIMES.get();
+        let t = TIMES.get();
+        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
         log::warn!(
-            "tick: slow, {:.1} ms (object scan {:.1}, scene {:.1}, the rest {:.1}; {} objects)",
-            took.as_secs_f32() * 1000.0,
-            scan.as_secs_f32() * 1000.0,
-            scene.as_secs_f32() * 1000.0,
-            (took.saturating_sub(scan + scene)).as_secs_f32() * 1000.0,
+            "tick: slow, {:.1} ms (object walk {:.1}, {} text boxes {:.1}, {} movie players {:.1}, scene {:.1}, \
+             the rest {:.1}; {} objects)",
+            ms(took),
+            ms(t.walk),
+            t.text_boxes,
+            ms(t.text),
+            t.players,
+            ms(t.movies),
+            ms(t.scene),
+            ms(took.saturating_sub(t.walk + t.text + t.movies + t.scene)),
             rt::GObjects.Num(),
         );
     }
@@ -156,6 +185,8 @@ struct Watch {
     next_players: Vec<(i32, usize)>,
     next_text_boxes: Vec<(i32, usize)>,
     pos: i32,
+    /// The whole list has been walked once: the walk slows down from here.
+    walked_once: bool,
     /// What each class seen so far is: a few thousand classes, against
     /// hundreds of thousands of objects. Keyed by the class's address and
     /// its name, so a class freed on a level change and another allocated
@@ -175,8 +206,14 @@ enum Kind {
     Other,
 }
 
-/// Objects walked per tick, at most: a full pass takes well under a second.
+/// Objects walked per tick, at most, on the first pass and while looking
+/// for the sound manager: quick, so the jukebox is ready early.
 const WATCH_SLICE: i32 = 25_000;
+/// And per tick from then on. The walk runs for the whole session, and at
+/// the first pass's rate it was the tick's one real cost, up to its whole
+/// time budget twenty times a second. A pass at this rate takes about a
+/// second, so a movie with its own soundtrack is noticed within that.
+const WATCH_SLICE_STEADY: i32 = 6_000;
 /// And for no longer than this per tick. Loading a save creates thousands of
 /// new kinds of object, each looked up once, which made a slice take 4 ms;
 /// a slow slice now stops early and the walk carries on next tick.
@@ -204,7 +241,8 @@ fn kind_of(class: *mut sdk::config::UClass) -> Kind {
 /// Walks the next slice of GObjects.
 fn watch_step(w: &mut Watch) {
     let num = rt::GObjects.Num();
-    let mut end = (w.pos + WATCH_SLICE).min(num);
+    let slice = if w.walked_once { WATCH_SLICE_STEADY } else { WATCH_SLICE };
+    let mut end = (w.pos + slice).min(num);
     let started = std::time::Instant::now();
     for index in w.pos..end {
         // The clock is read every 512 objects, not every one.
@@ -229,6 +267,7 @@ fn watch_step(w: &mut Watch) {
         w.players = std::mem::take(&mut w.next_players);
         w.text_boxes = std::mem::take(&mut w.next_text_boxes);
         w.pos = 0;
+        w.walked_once = true;
     }
 }
 
@@ -256,15 +295,28 @@ pub static GAME_TYPING: AtomicBool = AtomicBool::new(false);
 fn watch() -> bool {
     let mut guard = WATCH.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.get_or_insert_with(Watch::default);
+    let started = std::time::Instant::now();
     watch_step(w);
+    let walk = started.elapsed();
     let typing = w.text_boxes.iter().filter(|e| alive(w, e, Kind::TextBox)).any(|&(_, ptr)| {
         unsafe { &mut *(ptr as *mut UWidget) }.HasKeyboardFocus()
     });
     GAME_TYPING.store(typing, Ordering::Relaxed);
-    w.players.iter().filter(|e| alive(w, e, Kind::Player)).any(|&(_, ptr)| {
+    let text = started.elapsed().saturating_sub(walk);
+    let movie = w.players.iter().filter(|e| alive(w, e, Kind::Player)).any(|&(_, ptr)| {
         let player = unsafe { &mut *(ptr as *mut UManaPlayer) };
         player.IsPlaying() && unsafe { player.ManaMovie.as_ref() }.is_some_and(|m| m.AudioTracks.Num() > 0)
-    })
+    });
+    let movies = started.elapsed().saturating_sub(walk + text);
+    TIMES.set(Times {
+        walk,
+        text,
+        text_boxes: w.text_boxes.len(),
+        movies,
+        players: w.players.len(),
+        scene: std::time::Duration::ZERO,
+    });
+    movie
 }
 
 thread_local! {
@@ -366,11 +418,12 @@ impl Game {
         // one) can't be muted like the game's music, so the jukebox steps
         // aside for it. Silent movies play the game's music tracks instead,
         // which the jukebox replaces as usual.
-        let started = std::time::Instant::now();
         let movie = watch();
-        let scanned = started.elapsed();
+        let started = std::time::Instant::now();
         let scene = self.scene_after_watch(movie);
-        TIMES.set((scanned, started.elapsed().saturating_sub(scanned)));
+        let mut times = TIMES.get();
+        times.scene = started.elapsed();
+        TIMES.set(times);
         scene
     }
 

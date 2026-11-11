@@ -55,6 +55,9 @@ fn game_build() -> String {
 /// empty, so the file is current within a moment.
 fn init_logging(path: &std::path::Path) {
     use std::io::Write;
+    // Last session's log is kept beside the new one: after a crash the game
+    // is usually started again before anyone thinks to look at the log.
+    let _ = std::fs::rename(path, path.with_extension("log.old"));
     let Ok(file) = File::create(path) else { return };
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -107,10 +110,23 @@ fn main(this_module: HMODULE) {
     // out as the known ones; the song check then goes over every song on
     // this build and corrects the list.
     let build = game_build();
+    let mut changed = false;
     if config.game_build != build {
         log::info!("main: new game build, starting from the {} songs known to have no audio", state::KNOWN_SILENT.len());
         config.unplayable = state::KNOWN_SILENT.iter().map(|cue| format!("game:{cue}")).collect();
-        config.game_build = build;
+        config.game_build = build.clone();
+        changed = true;
+    }
+    // On the build this jukebox was made for, that list is the answer: it
+    // is what the song check finds there. The check can only run while no
+    // game song is playing, so for someone who plays game songs from the
+    // moment the game starts it would never finish; it's left for a build
+    // the jukebox doesn't know, and for "Check songs again".
+    if build == format!("{SUPPORTED_BUILD:#010X}") && config.checked_build != build {
+        config.checked_build = build;
+        changed = true;
+    }
+    if changed {
         config.save(&config_path);
     }
     let music_dir = config.music_dir(&dir);
@@ -124,6 +140,11 @@ fn main(this_module: HMODULE) {
     if !config::persisting() {
         state::lock().notice = Some(
             "Your settings file couldn't be read, so nothing is saved this session. Close the game and check ffrs_jukebox.toml."
+                .into(),
+        );
+    } else if config::restored() {
+        state::lock().notice = Some(
+            "Your settings file was damaged, so your settings were restored from the copy made at the last good start."
                 .into(),
         );
     }
@@ -226,39 +247,52 @@ fn game_image() -> Option<(usize, usize, u32)> {
 /// earlier, only shows that it needs an update), since hooking whatever lies
 /// there now would crash the game.
 fn hook_process_event() {
-    let unsupported = |why: &str| {
-        log::error!("main: {why}; the jukebox stays off on this game version");
+    const NEEDS_UPDATE: &str = "This version of the game isn't supported yet. Check for a jukebox update.";
+    const OTHER_MOD: &str =
+        "Another mod has changed the part of the game the jukebox hooks into, so the jukebox is off. Try it without your other mods.";
+    let unsupported = |why: &str, shown: &str| {
+        log::error!("main: {why}; the jukebox stays off");
         UNSUPPORTED.store(true, Ordering::SeqCst);
-        state::lock().error =
-            Some("This version of the game isn't supported yet. Check for a jukebox update.".into());
+        state::lock().error = Some(shown.into());
     };
     let Some((base, size, stamp)) = game_image() else {
-        return unsupported("could not find the game's image");
+        return unsupported("could not find the game's image", NEEDS_UPDATE);
     };
-    if stamp != SUPPORTED_BUILD {
+    let known_build = stamp == SUPPORTED_BUILD;
+    if !known_build {
         let why = format!("the game build is {stamp:#010X}, this jukebox was made for {SUPPORTED_BUILD:#010X}");
         // Only by choice, in the settings file: the game's code is checked
         // where the jukebox hooks it, but the rest of what it relies on
         // (offsets into the game's objects) can't be, and may have moved.
         if !state::lock().config.allow_untested_build {
-            return unsupported(&why);
+            return unsupported(&why, NEEDS_UPDATE);
         }
         log::warn!("main: {why}; running anyway (allow_untested_build), which may crash the game");
         state::lock().notice = Some("Running on an untested game build (allow_untested_build): it may crash.".into());
     }
     if sdk::config::PROCESS_EVENT + 0x90 > size {
-        return unsupported("ProcessEvent lies outside the game's image");
+        return unsupported("ProcessEvent lies outside the game's image", NEEDS_UPDATE);
     }
     let entry = (base + sdk::config::PROCESS_EVENT) as *mut u8;
     let at = |offset: usize, bytes: &[u8]| unsafe { std::slice::from_raw_parts(entry.add(offset), bytes.len()) } == bytes;
-    if !at(0x00, &[0x40, 0x55, 0x56, 0x57]) {
-        return unsupported("ProcessEvent isn't where this jukebox expects it");
-    }
-    let process_event = if at(0x87, &[0xEB, 0x03]) && at(0x8C, &[0x0F, 0x84]) {
+    let entry_ok = at(0x00, &[0x40, 0x55, 0x56, 0x57]);
+    let inside_ok = at(0x87, &[0xEB, 0x03]) && at(0x8C, &[0x0F, 0x84]);
+    // On the build the jukebox was made for, the build stamp already says
+    // where ProcessEvent is. Its first bytes differing there means another
+    // mod hooked its entry first, which leaves the spot inside it as it was.
+    // On an untested build the first bytes are the only proof there is.
+    let process_event = if inside_ok && (entry_ok || known_build) {
+        if !entry_ok {
+            log::info!("main: another mod has hooked ProcessEvent's entry; hooking inside it as usual");
+        }
         unsafe { entry.add(0x8C) }
-    } else {
+    } else if entry_ok {
         log::warn!("main: ProcessEvent+0x8C not as expected, hooking its entry instead");
         entry
+    } else if known_build {
+        return unsupported("something else has changed ProcessEvent at its entry and inside", OTHER_MOD);
+    } else {
+        return unsupported("ProcessEvent isn't where this jukebox expects it", NEEDS_UPDATE);
     };
     match MidHook::install(process_event, |_ctx| game::on_process_event()) {
         Ok(hook) => {
@@ -269,7 +303,7 @@ fn hook_process_event() {
         }
         // Without the hook nothing would ever play; the menu says so rather
         // than looking like it works.
-        Err(e) => unsupported(&format!("could not hook ProcessEvent: {e}")),
+        Err(e) => unsupported(&format!("could not hook ProcessEvent: {e}"), NEEDS_UPDATE),
     }
 }
 

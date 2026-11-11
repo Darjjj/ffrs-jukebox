@@ -132,6 +132,8 @@ pub struct Shared {
     pub track_serial: u64,
     /// Songs checked so far, and in all, while the song check runs.
     pub check_progress: Option<(usize, usize)>,
+    /// The song check is waiting for the jukebox's game song to stop.
+    pub check_waiting: bool,
     pub error: Option<String>,
     /// A standing warning shown under the controls, kept for the session
     /// (running on a game build the jukebox wasn't checked against).
